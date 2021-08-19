@@ -3,10 +3,10 @@ import { Injectable } from '@angular/core';
 import { environment } from '~/environments/environment';
 
 export class AppConstants {
-  public static readonly organization = 'ceph';
-  public static readonly projectName = 'Ceph Dashboard';
-  public static readonly license = 'Free software (LGPL 2.1).';
-  public static readonly copyright = 'Copyright(c) ' + environment.year + ' Ceph contributors.';
+  public static readonly organization = 'ABLECLOUD';
+  public static readonly projectName = 'Glue Dashboard';
+  public static readonly license = 'ABLESTACK Bronto (v2.0.0) - Powered By Ceph';
+  public static readonly copyright = 'Copyright(c) ' + environment.year + ' ABLECLOUD.Co.Ltd';
 }
 
 export enum URLVerbs {
