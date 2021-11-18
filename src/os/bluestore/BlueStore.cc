@@ -8324,6 +8324,7 @@ void BlueStore::_fsck_check_object_omap(FSCKDepth depth,
 	  txn->set(new_omap_prefix, new_head, header);
 	  txn_cost += new_head.length() + header.length();
 	}
+	it->next();
       }
       // tail
       {
@@ -8337,7 +8338,6 @@ void BlueStore::_fsck_check_object_omap(FSCKDepth depth,
       string final_key;
       Onode::calc_omap_key(new_flags, o.get(), string(), &final_key);
       size_t base_key_len = final_key.size();
-      it->next();
       while (it->valid() && it->key() < tail) {
 	string user_key;
 	o->decode_omap_key(it->key(), &user_key);
@@ -9832,6 +9832,23 @@ void BlueStore::inject_zombie_spanning_blob(coll_t cid, ghobject_t oid,
 
   _record_onode(o, txn);
   db->submit_transaction_sync(txn);
+}
+
+void BlueStore::inject_bluefs_file(std::string_view dir, std::string_view name, size_t new_size)
+{
+  ceph_assert(bluefs);
+
+  BlueFS::FileWriter* p_handle = nullptr;
+  auto ret = bluefs->open_for_write(dir, name, &p_handle, false);
+  ceph_assert(ret == 0);
+
+  std::string s('0', new_size);
+  bufferlist bl;
+  bl.append(s);
+  p_handle->append(bl);
+
+  bluefs->fsync(p_handle);
+  bluefs->close_writer(p_handle);
 }
 
 void BlueStore::collect_metadata(map<string,string> *pm)
@@ -17369,8 +17386,13 @@ uint8_t RocksDBBlueFSVolumeSelector::select_prefer_bdev(void* h) {
 
 void RocksDBBlueFSVolumeSelector::get_paths(const std::string& base, paths& res) const
 {
-  res.emplace_back(base, l_totals[LEVEL_DB - LEVEL_FIRST]);
-  res.emplace_back(base + ".slow", l_totals[LEVEL_SLOW - LEVEL_FIRST]);
+  auto db_size = l_totals[LEVEL_DB - LEVEL_FIRST];
+  res.emplace_back(base, db_size);
+  auto slow_size = l_totals[LEVEL_SLOW - LEVEL_FIRST];
+  if (slow_size == 0) {
+    slow_size = db_size;
+  }
+  res.emplace_back(base + ".slow", slow_size);
 }
 
 void* RocksDBBlueFSVolumeSelector::get_hint_by_dir(std::string_view dirname) const {
