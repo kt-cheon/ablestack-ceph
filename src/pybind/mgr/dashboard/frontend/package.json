@@ -3,13 +3,13 @@
   "version": "0.0.0",
   "license": "MIT",
   "config": {
-    "locale": "en-US"
+    "locale": "ko"
   },
   "scripts": {
     "ng": "ng",
     "start": "npm run env_build && ng serve --host 0.0.0.0 --ssl",
     "build": "npm run env_build && ng build --configuration=$npm_package_config_locale",
-    "build:localize": "node cd --env --pre && ng build --localize",
+    "build:localize": "ng build --localize",
     "postbuild:localize": "node cd --res",
     "env_build": "node cd --env",
     "i18n": "npm run i18n:extract && npm run i18n:push && npm run i18n:pull && npm run i18n:merge",
@@ -113,7 +113,7 @@
     "@angular/compiler-cli": "11.2.14",
     "@angular/language-service": "11.2.14",
     "@applitools/eyes-cypress": "^3.22.0",
-    "@compodoc/compodoc": "1.1.11",
+    "@compodoc/compodoc": "^1.1.15",
     "@types/brace-expansion": "^1.1.0",
     "@types/jest": "26.0.14",
     "@types/lodash": "4.14.161",
@@ -131,7 +131,7 @@
     "jest-canvas-mock": "2.3.0",
     "jest-preset-angular": "8.3.1",
     "jest-silent-reporter": "0.2.1",
-    "mocha-junit-reporter": "2.0.0",
+    "mocha-junit-reporter": "^2.0.2",
     "ng-bullet": "1.0.3",
     "ng-mocks": "10.2.0",
     "npm-force-resolutions": "0.0.3",
@@ -141,7 +141,7 @@
     "start-server-and-test": "1.12.1",
     "stylelint": "13.13.1",
     "stylelint-config-sass-guidelines": "7.1.0",
-    "stylelint-declaration-use-variable": "1.7.2",
+    "stylelint-declaration-use-variable": "^1.7.3",
     "transifex-i18ntool": "1.1.0",
     "ts-node": "9.0.0",
     "tslint": "6.1.3",
