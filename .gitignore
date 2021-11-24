@@ -37,6 +37,8 @@ core
 *.log
 /src/td
 /src/vstart_environment.sh
+/src/civetweb/
+/src/jaegertracing/thrift/
 
 # alpine abuild things
 .abuild/
