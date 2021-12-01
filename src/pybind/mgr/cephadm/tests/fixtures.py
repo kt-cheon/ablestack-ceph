@@ -18,6 +18,12 @@ from orchestrator import raise_if_exception, OrchResult, HostSpec, DaemonDescrip
 from tests import mock
 
 
+def async_side_effect(result):
+    async def side_effect(*args, **kwargs):
+        return result
+    return side_effect
+
+
 def get_ceph_option(_, key):
     return __file__
 
@@ -80,7 +86,6 @@ def with_cephadm_module(module_options=None, store=None):
     with mock.patch("cephadm.module.CephadmOrchestrator.get_ceph_option", get_ceph_option),\
             mock.patch("cephadm.services.osd.RemoveUtil._run_mon_cmd"), \
             mock.patch("cephadm.module.CephadmOrchestrator.get_osdmap"), \
-            mock.patch("cephadm.services.osd.OSDService.get_osdspec_affinity", return_value='test_spec'), \
             mock.patch("cephadm.module.CephadmOrchestrator.remote"), \
             mock.patch("cephadm.agent.CephadmAgentHelpers._request_agent_acks"), \
             mock.patch("cephadm.agent.CephadmAgentHelpers._apply_agent", return_value=False), \
@@ -184,9 +189,3 @@ def make_daemons_running(cephadm_module, service_name):
     own_dds = cephadm_module.cache.get_daemons_by_service(service_name)
     for dd in own_dds:
         dd.status = DaemonDescriptionStatus.running  # We're changing the reference
-
-
-def _deploy_cephadm_binary(host):
-    def foo(*args, **kwargs):
-        return True
-    return foo

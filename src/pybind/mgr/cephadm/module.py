@@ -356,6 +356,12 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             desc='First port agent will try to bind to (will also try up to next 1000 subsequent ports if blocked)'
         ),
         Option(
+            'agent_down_multiplier',
+            type='float',
+            default=3.0,
+            desc='Multiplied by agent refresh rate to calculate how long agent must not report before being marked down'
+        ),
+        Option(
             'max_osd_draining_count',
             type='int',
             default=10,
@@ -423,6 +429,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.ssh_pub: Optional[str] = None
             self.use_agent = False
             self.agent_refresh_rate = 0
+            self.agent_down_multiplier = 0.0
             self.agent_starting_port = 0
             self.apply_spec_fails: List[Tuple[str, str]] = []
             self.max_osd_draining_count = 10
@@ -587,12 +594,15 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self._trigger_osd_removal()
 
     def _trigger_osd_removal(self) -> None:
+        remove_queue = self.to_remove_osds.as_osd_ids()
+        if not remove_queue:
+            return
         data = self.get("osd_stats")
         for osd in data.get('osd_stats', []):
             if osd.get('num_pgs') == 0:
                 # if _ANY_ osd that is currently in the queue appears to be empty,
                 # start the removal process
-                if int(osd.get('osd')) in self.to_remove_osds.as_osd_ids():
+                if int(osd.get('osd')) in remove_queue:
                     self.log.debug('Found empty osd. Starting removal process')
                     # if the osd that is now empty is also part of the removal queue
                     # start the process
@@ -716,8 +726,6 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             sd.rank = int(d['rank']) if d.get('rank') is not None else None
             sd.rank_generation = int(d['rank_generation']) if d.get(
                 'rank_generation') is not None else None
-            if sd.daemon_type == 'osd':
-                sd.osdspec_affinity = self.osd_service.get_osdspec_affinity(sd.daemon_id)
             if 'state' in d:
                 sd.status_desc = d['state']
                 sd.status = {
@@ -1927,7 +1935,7 @@ Then run the following:
             for h, dm in self.cache.get_daemons_with_volatile_status():
                 osds_to_remove = []
                 for name, dd in dm.items():
-                    if dd.daemon_type == 'osd' and (dd.service_name() == service_name or not dd.osdspec_affinity):
+                    if dd.daemon_type == 'osd' and dd.service_name() == service_name:
                         osds_to_remove.append(str(dd.daemon_id))
                 if osds_to_remove:
                     osds_msg[h] = osds_to_remove
