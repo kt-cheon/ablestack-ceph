@@ -88,14 +88,16 @@ public:
 
   /// Creates empty transaction
   TransactionRef create_transaction(
-      Transaction::src_t src) final {
-    return cache->create_transaction(src);
+      Transaction::src_t src,
+      const char* name) final {
+    return cache->create_transaction(src, name, false);
   }
 
   /// Creates empty weak transaction
   TransactionRef create_weak_transaction(
-      Transaction::src_t src) {
-    return cache->create_weak_transaction(src);
+      Transaction::src_t src,
+      const char* name) {
+    return cache->create_transaction(src, name, true);
   }
 
   /// Resets transaction
@@ -154,12 +156,11 @@ public:
       pref.get_paddr(),
       pref.get_length(),
       [this, pin=std::move(pin)](T &extent) mutable {
-	if (!extent.has_pin()) {
-	  assert(!(extent.has_been_invalidated() ||
-		   pin->has_been_invalidated()));
-	  extent.set_pin(std::move(pin));
-	  lba_manager->add_pin(extent.get_pin());
-	}
+	assert(!extent.has_pin());
+	assert(!extent.has_been_invalidated());
+	assert(!pin->has_been_invalidated());
+	extent.set_pin(std::move(pin));
+	lba_manager->add_pin(extent.get_pin());
       }
     ).si_then([FNAME, &t](auto ref) mutable -> ret {
       DEBUGT("got extent {}", t, *ref);

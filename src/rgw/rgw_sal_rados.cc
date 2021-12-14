@@ -52,24 +52,6 @@ static string mp_ns = RGW_OBJ_NS_MULTIPART;
 
 namespace rgw::sal {
 
-struct multipart_upload_info
-{
-  rgw_placement_rule dest_placement;
-
-  void encode(bufferlist& bl) const {
-    ENCODE_START(1, 1, bl);
-    encode(dest_placement, bl);
-    ENCODE_FINISH(bl);
-  }
-
-  void decode(bufferlist::const_iterator& bl) {
-    DECODE_START(1, bl);
-    decode(dest_placement, bl);
-    DECODE_FINISH(bl);
-  }
-};
-WRITE_CLASS_ENCODER(multipart_upload_info)
-
 // default number of entries to list with each bucket listing call
 // (use marker to bridge between calls)
 static constexpr size_t listing_max_entries = 1000;
@@ -975,6 +957,11 @@ int RadosBucket::abort_multiparts(const DoutPrefixProvider* dpp,
 std::unique_ptr<User> RadosStore::get_user(const rgw_user &u)
 {
   return std::make_unique<RadosUser>(this, u);
+}
+
+std::string RadosStore::get_cluster_id(const DoutPrefixProvider* dpp,  optional_yield y)
+{
+  return getRados()->get_cluster_fsid(dpp, y);
 }
 
 int RadosStore::get_user_by_access_key(const DoutPrefixProvider* dpp, const std::string& key, optional_yield y, std::unique_ptr<User>* user)
@@ -1986,15 +1973,20 @@ int RadosMultipartUpload::abort(const DoutPrefixProvider *dpp, CephContext *cct,
     }
   } while (truncated);
 
-  /* use upload id as tag and do it synchronously */
-  ret = store->getRados()->send_chain_to_gc(chain, mp_obj.get_upload_id());
-  if (ret < 0) {
-    ldpp_dout(dpp, 5) << __func__ << ": gc->send_chain() returned " << ret << dendl;
-    if (ret == -ENOENT) {
-      return -ERR_NO_SUCH_UPLOAD;
-    }
-    //Delete objects inline if send chain to gc fails
+  if (store->getRados()->get_gc() == nullptr) {
+    //Delete objects inline if gc hasn't been initialised (in case when bypass gc is specified)
     store->getRados()->delete_objs_inline(dpp, chain, mp_obj.get_upload_id());
+  } else {
+    /* use upload id as tag and do it synchronously */
+    ret = store->getRados()->send_chain_to_gc(chain, mp_obj.get_upload_id());
+    if (ret < 0) {
+      ldpp_dout(dpp, 5) << __func__ << ": gc->send_chain() returned " << ret << dendl;
+      if (ret == -ENOENT) {
+        return -ERR_NO_SUCH_UPLOAD;
+      }
+      //Delete objects inline if send chain to gc fails
+      store->getRados()->delete_objs_inline(dpp, chain, mp_obj.get_upload_id());
+    }
   }
 
   std::unique_ptr<rgw::sal::Object::DeleteOp> del_op = meta_obj->get_delete_op(obj_ctx);
