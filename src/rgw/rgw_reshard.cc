@@ -349,15 +349,15 @@ static int create_new_bucket_instance(rgw::sal::RadosStore* store,
   new_bucket_info.new_bucket_instance_id.clear();
   new_bucket_info.reshard_status = cls_rgw_reshard_status::NOT_RESHARDING;
 
-  int ret = store->svc()->bi->init_index(dpp, new_bucket_info);
+  int ret = store->getRados()->put_bucket_instance_info(new_bucket_info, true, real_time(), &attrs, dpp);
   if (ret < 0) {
-    cerr << "ERROR: failed to init new bucket indexes: " << cpp_strerror(-ret) << std::endl;
+    cerr << "ERROR: failed to store new bucket instance info: " << cpp_strerror(-ret) << std::endl;
     return ret;
   }
 
-  ret = store->getRados()->put_bucket_instance_info(new_bucket_info, true, real_time(), &attrs, dpp);
+  ret = store->svc()->bi->init_index(dpp, new_bucket_info);
   if (ret < 0) {
-    cerr << "ERROR: failed to store new bucket instance info: " << cpp_strerror(-ret) << std::endl;
+    cerr << "ERROR: failed to init new bucket indexes: " << cpp_strerror(-ret) << std::endl;
     return ret;
   }
 
@@ -756,7 +756,7 @@ int RGWBucketReshard::execute(int num_shards, int max_op_entries,
 
   // resharding successful, so remove old bucket index shards; use
   // best effort and don't report out an error; the lock isn't needed
-  // at this point since all we're using a best effor to to remove old
+  // at this point since all we're using a best effort to remove old
   // shard objects
   ret = store->svc()->bi->clean_index(dpp, bucket_info);
   if (ret < 0) {

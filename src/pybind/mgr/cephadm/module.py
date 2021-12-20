@@ -52,7 +52,7 @@ from .services.iscsi import IscsiService
 from .services.nfs import NFSService
 from .services.osd import OSDRemovalQueue, OSDService, OSD, NotFoundError
 from .services.monitoring import GrafanaService, AlertmanagerService, PrometheusService, \
-    NodeExporterService
+    NodeExporterService, SNMPGatewayService
 from .schedule import HostAssignment
 from .inventory import Inventory, SpecStore, HostCache, EventStore, ClientKeyringStore, ClientKeyringSpec
 from .upgrade import CephadmUpgrade
@@ -96,6 +96,7 @@ DEFAULT_ALERT_MANAGER_IMAGE = 'quay.io/prometheus/alertmanager:v0.20.0'
 DEFAULT_GRAFANA_IMAGE = 'quay.io/ceph/ceph-grafana:6.7.4'
 DEFAULT_HAPROXY_IMAGE = 'docker.io/library/haproxy:2.3'
 DEFAULT_KEEPALIVED_IMAGE = 'docker.io/arcts/keepalived'
+DEFAULT_SNMP_GATEWAY_IMAGE = 'docker.io/maxwo/snmp-notifier:v1.2.1'
 # ------------------------------------------------------------------------------
 
 
@@ -206,6 +207,11 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             desc='Keepalived container image',
         ),
         Option(
+            'container_image_snmp_gateway',
+            default=DEFAULT_SNMP_GATEWAY_IMAGE,
+            desc='SNMP Gateway container image',
+        ),
+        Option(
             'warn_on_stray_hosts',
             type='bool',
             default=True,
@@ -278,6 +284,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             default='*',
             desc='PlacementSpec describing on which hosts to manage /etc/ceph/ceph.conf',
         ),
+        # not used anymore
         Option(
             'registry_url',
             type='str',
@@ -296,6 +303,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             default=None,
             desc='Custom repository password'
         ),
+        ####
         Option(
             'registry_insecure',
             type='bool',
@@ -402,6 +410,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.container_image_node_exporter = ''
             self.container_image_haproxy = ''
             self.container_image_keepalived = ''
+            self.container_image_snmp_gateway = ''
             self.warn_on_stray_hosts = True
             self.warn_on_stray_daemons = True
             self.warn_on_failed_host_check = True
@@ -493,7 +502,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             RgwService, RbdMirrorService, GrafanaService, AlertmanagerService,
             PrometheusService, NodeExporterService, CrashService, IscsiService,
             IngressService, CustomContainerService, CephfsMirrorService,
-            CephadmAgent
+            CephadmAgent, SNMPGatewayService
         ]
 
         # https://github.com/python/mypy/issues/8993
@@ -643,7 +652,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
         suffix = daemon_type not in [
             'mon', 'crash',
             'prometheus', 'node-exporter', 'grafana', 'alertmanager',
-            'container', 'agent'
+            'container', 'agent', 'snmp-gateway'
         ]
         if forcename:
             if len([d for d in existing if d.daemon_id == forcename]):
@@ -750,12 +759,12 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.offline_hosts.remove(host)
 
     def update_failed_daemon_health_check(self) -> None:
-        self.remove_health_warning('CEPHADM_FAILED_DAEMON')
         failed_daemons = []
         for dd in self.cache.get_error_daemons():
             failed_daemons.append('daemon %s on %s is in %s state' % (
                 dd.name(), dd.hostname, dd.status_desc
             ))
+        self.remove_health_warning('CEPHADM_FAILED_DAEMON')
         if failed_daemons:
             self.set_health_warning('CEPHADM_FAILED_DAEMON', f'{len(failed_daemons)} failed cephadm daemon(s)', len(
                 failed_daemons), failed_daemons)
@@ -954,14 +963,12 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
         if not (url and username and password) and (inbuf is None or len(inbuf) == 0):
             return -errno.EINVAL, "", ("Invalid arguments. Please provide arguments <url> <username> <password> "
                                        "or -i <login credentials json file>")
-        elif not (url and username and password):
+        elif (url and username and password):
+            registry_json = {'url': url, 'username': username, 'password': password}
+        else:
             assert isinstance(inbuf, str)
-            login_info = json.loads(inbuf)
-            if "url" in login_info and "username" in login_info and "password" in login_info:
-                url = login_info["url"]
-                username = login_info["username"]
-                password = login_info["password"]
-            else:
+            registry_json = json.loads(inbuf)
+            if "url" not in registry_json or "username" not in registry_json or "password" not in registry_json:
                 return -errno.EINVAL, "", ("json provided for custom registry login did not include all necessary fields. "
                                            "Please setup json file as\n"
                                            "{\n"
@@ -969,6 +976,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
                                            " \"username\": \"REGISTRY_USERNAME\",\n"
                                            " \"password\": \"REGISTRY_PASSWORD\"\n"
                                            "}\n")
+
         # verify login info works by attempting login on random host
         host = None
         for host_name in self.inventory.keys():
@@ -976,14 +984,12 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             break
         if not host:
             raise OrchestratorError('no hosts defined')
-        r = self.wait_async(CephadmServe(self)._registry_login(host, url, username, password))
+        r = self.wait_async(CephadmServe(self)._registry_login(host, registry_json))
         if r is not None:
             return 1, '', r
         # if logins succeeded, store info
         self.log.debug("Host logins successful. Storing login info.")
-        self.set_module_option('registry_url', url)
-        self.set_module_option('registry_username', username)
-        self.set_module_option('registry_password', password)
+        self.set_store('registry_credentials', json.dumps(registry_json))
         # distribute new login info to all hosts
         self.cache.distribute_new_registry_login_info()
         return 0, "registry login scheduled", ''
@@ -1289,6 +1295,8 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             # is only available when a container is deployed (given
             # via spec).
             image = None
+        elif daemon_type == 'snmp-gateway':
+            image = self.container_image_snmp_gateway
         else:
             assert False, daemon_type
 
@@ -2126,7 +2134,7 @@ Then run the following:
             osd_id = o.get('osd')
             if osd_id is None:
                 raise OrchestratorError("Could not retrieve osd_id from osd_map")
-            if not only_up or (o['up_from'] > 0):
+            if not only_up:
                 r[str(osd_id)] = o.get('uuid', '')
         return r
 
@@ -2244,7 +2252,7 @@ Then run the following:
             need = {
                 'prometheus': ['mgr', 'alertmanager', 'node-exporter', 'ingress'],
                 'grafana': ['prometheus'],
-                'alertmanager': ['mgr', 'alertmanager'],
+                'alertmanager': ['mgr', 'alertmanager', 'snmp-gateway'],
             }
             for dep_type in need.get(daemon_type, []):
                 for dd in self.cache.get_daemons_by_type(dep_type):
@@ -2425,6 +2433,7 @@ Then run the following:
                 'node-exporter': PlacementSpec(host_pattern='*'),
                 'crash': PlacementSpec(host_pattern='*'),
                 'container': PlacementSpec(count=1),
+                'snmp-gateway': PlacementSpec(count=1),
             }
             spec.placement = defaults[spec.service_type]
         elif spec.service_type in ['mon', 'mgr'] and \
@@ -2535,6 +2544,10 @@ Then run the following:
 
     @handle_orch_error
     def apply_container(self, spec: ServiceSpec) -> str:
+        return self._apply(spec)
+
+    @handle_orch_error
+    def apply_snmp_gateway(self, spec: ServiceSpec) -> str:
         return self._apply(spec)
 
     @handle_orch_error

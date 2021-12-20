@@ -254,7 +254,8 @@ private:
           ).si_then([&](auto onode_ret) {
             onode = std::move(onode_ret);
             return f(t, *onode);
-          }).si_then([&ret](auto _ret) {
+          }).si_then([&ret, &onode](auto _ret) {
+	    onode.reset();
             ret = _ret;
           });
         });
@@ -305,6 +306,7 @@ private:
   TransactionManagerRef transaction_manager;
   CollectionManagerRef collection_manager;
   OnodeManagerRef onode_manager;
+  const uint32_t max_object_size = 0;
 
   using tm_iertr = TransactionManager::base_iertr;
   using tm_ret = tm_iertr::future<>;
@@ -388,7 +390,7 @@ private:
   seastar::future<> write_fsid(uuid_d new_osd_fsid);
 };
 
-std::unique_ptr<SeaStore> make_seastore(
+seastar::future<std::unique_ptr<SeaStore>> make_seastore(
   const std::string &device,
   const ConfigValues &config);
 }

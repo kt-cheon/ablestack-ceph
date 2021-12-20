@@ -22,6 +22,7 @@
 #include "crimson/os/futurized_collection.h"
 
 #include "crimson/os/seastore/segment_cleaner.h"
+#include "crimson/os/seastore/segment_manager.h"
 #include "crimson/os/seastore/segment_manager/block.h"
 #include "crimson/os/seastore/collection_manager/flat_collection_manager.h"
 #include "crimson/os/seastore/onode_manager/staged-fltree/fltree_onode_manager.h"
@@ -29,6 +30,7 @@
 #include "crimson/os/seastore/segment_manager/ephemeral.h"
 #include "crimson/os/seastore/onode_manager.h"
 #include "crimson/os/seastore/object_data_handler.h"
+
 
 using std::string;
 using crimson::common::local_conf;
@@ -68,6 +70,8 @@ public:
   }
 };
 
+using crimson::common::get_conf;
+
 SeaStore::SeaStore(
   const std::string& root,
   MDStoreRef mdstore,
@@ -80,7 +84,9 @@ SeaStore::SeaStore(
     segment_manager(std::move(sm)),
     transaction_manager(std::move(tm)),
     collection_manager(std::move(cm)),
-    onode_manager(std::move(om))
+    onode_manager(std::move(om)),
+    max_object_size(
+      get_conf<uint64_t>("seastore_default_max_object_size"))
 {
   register_metrics();
 }
@@ -459,7 +465,7 @@ SeaStore::read_errorator::future<ceph::bufferlist> SeaStore::read(
 	size - offset :
 	std::min(size - offset, len);
 
-      return ObjectDataHandler().read(
+      return ObjectDataHandler(max_object_size).read(
         ObjectDataHandler::context_t{
           *transaction_manager,
           t,
@@ -509,7 +515,7 @@ SeaStore::get_attr_errorator::future<ceph::bufferlist> SeaStore::get_attr(
       }
       return _omap_get_value(
         t,
-        layout.xattr_root.get(onode.get_hint()),
+        layout.xattr_root.get(onode.get_metadata_hint()),
         name);
     }
   ).handle_error(crimson::ct_error::input_output_error::handle([FNAME] {
@@ -607,7 +613,8 @@ SeaStore::omap_get_values(
     "omap_get_values",
     op_type_t::OMAP_GET_VALUES,
     [this, keys](auto &t, auto &onode) {
-      omap_root_t omap_root = onode.get_layout().omap_root.get(onode.get_hint());
+      omap_root_t omap_root = onode.get_layout().omap_root.get(
+	onode.get_metadata_hint());
       return _omap_get_values(
 	t,
 	std::move(omap_root),
@@ -685,7 +692,7 @@ SeaStore::_omap_list_ret SeaStore::_omap_list(
   const std::optional<std::string>& start,
   OMapManager::omap_list_config_t config) const
 {
-  auto root = omap_root.get(onode.get_hint());
+  auto root = omap_root.get(onode.get_metadata_hint());
   if (root.is_null()) {
     return seastar::make_ready_future<_omap_list_bare_ret>(
       true, omap_values_t{}
@@ -1068,7 +1075,7 @@ SeaStore::tm_ret SeaStore::_write(
   return seastar::do_with(
     std::move(_bl),
     [=, &ctx, &onode](auto &bl) {
-      return ObjectDataHandler().write(
+      return ObjectDataHandler(max_object_size).write(
         ObjectDataHandler::context_t{
           *transaction_manager,
           *ctx.transaction,
@@ -1089,13 +1096,13 @@ SeaStore::_omap_set_kvs(
 {
   return seastar::do_with(
     BtreeOMapManager(*transaction_manager),
-    omap_root.get(onode->get_hint()),
+    omap_root.get(onode->get_metadata_hint()),
     [&, keys=std::move(kvs)](auto &omap_manager, auto &root) {
       tm_iertr::future<> maybe_create_root =
         !root.is_null() ?
         tm_iertr::now() :
         omap_manager.initialize_omap(
-          t, onode->get_hint()
+          t, onode->get_metadata_hint()
         ).si_then([&root](auto new_root) {
           root = new_root;
         });
@@ -1146,13 +1153,13 @@ SeaStore::tm_ret SeaStore::_omap_rmkeys(
 {
   LOG_PREFIX(SeaStore::_omap_rmkeys);
   DEBUGT("{} {} keys", *ctx.transaction, *onode, keys.size());
-  auto omap_root = onode->get_layout().omap_root.get(onode->get_hint());
+  auto omap_root = onode->get_layout().omap_root.get(onode->get_metadata_hint());
   if (omap_root.is_null()) {
     return seastar::now();
   } else {
     return seastar::do_with(
       BtreeOMapManager(*transaction_manager),
-      onode->get_layout().omap_root.get(onode->get_hint()),
+      onode->get_layout().omap_root.get(onode->get_metadata_hint()),
       std::move(keys),
       [&ctx, &onode](
 	auto &omap_manager,
@@ -1198,7 +1205,7 @@ SeaStore::tm_ret SeaStore::_truncate(
   LOG_PREFIX(SeaStore::_truncate);
   DEBUGT("onode={} size={}", *ctx.transaction, *onode, size);
   onode->get_mutable_layout(*ctx.transaction).size = size;
-  return ObjectDataHandler().truncate(
+  return ObjectDataHandler(max_object_size).truncate(
     ObjectDataHandler::context_t{
       *transaction_manager,
       *ctx.transaction,
@@ -1376,45 +1383,45 @@ uuid_d SeaStore::get_fsid() const
   return segment_manager->get_meta().seastore_id;
 }
 
-std::unique_ptr<SeaStore> make_seastore(
+seastar::future<std::unique_ptr<SeaStore>> make_seastore(
   const std::string &device,
   const ConfigValues &config)
 {
-  auto sm = std::make_unique<
-    segment_manager::block::BlockSegmentManager
-    >(device + "/block");
+  return SegmentManager::get_segment_manager(
+    device
+  ).then([&device](auto sm) {
+    auto scanner = std::make_unique<ExtentReader>();
+    auto& scanner_ref = *scanner.get();
+    auto segment_cleaner = std::make_unique<SegmentCleaner>(
+      SegmentCleaner::config_t::get_default(),
+      std::move(scanner),
+      false /* detailed */);
 
-  auto scanner = std::make_unique<ExtentReader>();
-  auto& scanner_ref = *scanner.get();
-  auto segment_cleaner = std::make_unique<SegmentCleaner>(
-    SegmentCleaner::config_t::get_default(),
-    std::move(scanner),
-    false /* detailed */);
+    auto journal = std::make_unique<Journal>(*sm, scanner_ref);
+    auto cache = std::make_unique<Cache>(scanner_ref);
+    auto lba_manager = lba_manager::create_lba_manager(*sm, *cache);
 
-  auto journal = std::make_unique<Journal>(*sm, scanner_ref);
-  auto cache = std::make_unique<Cache>(scanner_ref);
-  auto lba_manager = lba_manager::create_lba_manager(*sm, *cache);
+    auto epm = std::make_unique<ExtentPlacementManager>(*cache, *lba_manager);
 
-  auto epm = std::make_unique<ExtentPlacementManager>(*cache, *lba_manager);
+    journal->set_segment_provider(&*segment_cleaner);
 
-  journal->set_segment_provider(&*segment_cleaner);
+    auto tm = std::make_unique<TransactionManager>(
+      *sm,
+      std::move(segment_cleaner),
+      std::move(journal),
+      std::move(cache),
+      std::move(lba_manager),
+      std::move(epm),
+      scanner_ref);
 
-  auto tm = std::make_unique<TransactionManager>(
-    *sm,
-    std::move(segment_cleaner),
-    std::move(journal),
-    std::move(cache),
-    std::move(lba_manager),
-    std::move(epm),
-    scanner_ref);
-
-  auto cm = std::make_unique<collection_manager::FlatCollectionManager>(*tm);
-  return std::make_unique<SeaStore>(
-    device,
-    std::move(sm),
-    std::move(tm),
-    std::move(cm),
-    std::make_unique<crimson::os::seastore::onode::FLTreeOnodeManager>(*tm));
+    auto cm = std::make_unique<collection_manager::FlatCollectionManager>(*tm);
+    return std::make_unique<SeaStore>(
+      device,
+      std::move(sm),
+      std::move(tm),
+      std::move(cm),
+      std::make_unique<crimson::os::seastore::onode::FLTreeOnodeManager>(*tm));
+  });
 }
 
 }
