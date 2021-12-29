@@ -117,6 +117,8 @@ export class ActionLabelsI18n {
   FLAGS: string;
   ENTER_MAINTENANCE: string;
   EXIT_MAINTENANCE: string;
+  START_DRAIN: string;
+  STOP_DRAIN: string;
 
   constructor() {
     /* Create a new item */
@@ -170,6 +172,8 @@ export class ActionLabelsI18n {
     this.FLAGS = $localize`Flags`;
     this.ENTER_MAINTENANCE = $localize`Enter Maintenance`;
     this.EXIT_MAINTENANCE = $localize`Exit Maintenance`;
+    this.START_DRAIN = $localize`Start Drain`;
+    this.STOP_DRAIN = $localize`Stop Drain`;
 
     /* Prometheus wording */
     this.RECREATE = $localize`Recreate`;

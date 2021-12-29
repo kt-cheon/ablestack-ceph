@@ -23,6 +23,8 @@
 #include <rte_ethdev.h>
 #include <rte_version.h>
 
+#include "include/str_map.h"
+
 #include "DPDK.h"
 #include "dpdk_rte.h"
 
@@ -123,6 +125,14 @@ namespace dpdk {
         args.push_back(string2vector("--no-huge"));
       }
 
+      for_each_pair(cct->_conf.get_val<std::string>("ms_dpdk_devs_allowlist"), " ",
+		    [&args] (std::string_view key, std::string_view val) {
+		      args.push_back(string2vector(std::string(key)));
+		      if (!val.empty()) {
+                        args.push_back(string2vector(std::string(val)));
+                      }
+		    });
+
       std::string rte_file_prefix;
       rte_file_prefix = "rte_";
       rte_file_prefix += cct->_conf->name.to_str();
@@ -137,17 +147,21 @@ namespace dpdk {
       if (!rte_initialized) {
         /* initialise the EAL for all */
         int ret = rte_eal_init(cargs.size(), cargs.data());
-        if (ret < 0)
-          return;
+	if (ret < 0) {
+          std::unique_lock locker(lock);
+          done = true;
+          cond.notify_all();
+          return ret;
+	}
         rte_initialized = true;
       }
 
-      std::unique_lock<std::mutex> l(lock);
+      std::unique_lock locker(lock);
       initialized = true;
       done = true;
       cond.notify_all();
       while (!stopped) {
-        cond.wait(l, [this] { return !funcs.empty() || stopped; });
+        cond.wait(locker, [this] { return !funcs.empty() || stopped; });
         if (!funcs.empty()) {
           auto f = std::move(funcs.front());
           funcs.pop_front();
@@ -156,10 +170,9 @@ namespace dpdk {
         }
       }
     });
-    std::unique_lock<std::mutex> l(lock);
-    while (!done)
-      cond.wait(l);
-    return 0;
+    std::unique_lock locker(lock);
+    cond.wait(locker, [&] { return done; });
+    return initialized ? 0 : -EIO;
   }
 
   size_t eal::mem_size(int num_cpus)
