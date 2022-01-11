@@ -1112,7 +1112,8 @@ struct LruOnodeCacheShard : public BlueStore::OnodeCacheShard {
       ++num_pinned;
     }
     ++num; // we count both pinned and unpinned entries
-    dout(20) << __func__ << " " << this << " " << o->oid << " added, num=" << num << dendl;
+    dout(20) << __func__ << " " << this << " " << o->oid << " added, num="
+             << num << dendl;
   }
   void _rm(BlueStore::Onode* o) override
   {
@@ -5074,6 +5075,19 @@ void BlueStore::_init_logger()
 		    NULL,
 		    PerfCountersBuilder::PRIO_DEBUGONLY,
 		    unit_t(UNIT_BYTES));
+
+  b.add_u64_counter(l_bluestore_write_big_skipped_blobs,
+      "write_big_skipped_blobs",
+      "Large aligned writes into fresh blobs skipped due to zero detection (blobs)");
+  b.add_u64_counter(l_bluestore_write_big_skipped_bytes,
+      "write_big_skipped_bytes",
+      "Large aligned writes into fresh blobs skipped due to zero detection (bytes)");
+  b.add_u64_counter(l_bluestore_write_small_skipped,
+      "write_small_skipped",
+      "Small writes into existing or sparse small blobs skipped due to zero detection");
+  b.add_u64_counter(l_bluestore_write_small_skipped_bytes,
+      "write_small_skipped_bytes",
+      "Small writes into existing or sparse small blobs skipped due to zero detection (bytes)");
   //****************************************
 
   // compressions stats
@@ -5176,12 +5190,17 @@ void BlueStore::_init_logger()
   b.add_time_avg(l_bluestore_omap_get_values_lat, "omap_get_values_lat",
     "Average omap get_values call latency",
     "ogvl", PerfCountersBuilder::PRIO_USEFUL);
+  b.add_time_avg(l_bluestore_omap_clear_lat, "omap_clear_lat",
+    "Average omap clear call latency");
   b.add_time_avg(l_bluestore_clist_lat, "clist_lat",
     "Average collection listing latency",
     "cl_l", PerfCountersBuilder::PRIO_USEFUL);
   b.add_time_avg(l_bluestore_remove_lat, "remove_lat",
     "Average removal latency",
     "rm_l", PerfCountersBuilder::PRIO_USEFUL);
+  b.add_time_avg(l_bluestore_truncate_lat, "truncate_lat",
+    "Average truncate latency",
+    "tr_l", PerfCountersBuilder::PRIO_USEFUL);
   //****************************************
 
   // Resulting size axis configuration for op histograms, values are in bytes
@@ -14252,12 +14271,24 @@ void BlueStore::_do_write_small(
   // temporarily just pad them to min_alloc_size and write them to a new place
   // on every update.
   if (bdev->is_smr()) {
-    BlobRef b = c->new_blob();
     uint64_t b_off = p2phase<uint64_t>(offset, alloc_len);
     uint64_t b_off0 = b_off;
-    _pad_zeros(&bl, &b_off0, min_alloc_size);
     o->extent_map.punch_hole(c, offset, length, &wctx->old_extents);
-    wctx->write(offset, b, alloc_len, b_off0, bl, b_off, length, false, true);
+
+    // Zero detection -- small block
+    if (!bl.is_zero()) {
+      BlobRef b = c->new_blob();
+      _pad_zeros(&bl, &b_off0, min_alloc_size);
+      wctx->write(offset, b, alloc_len, b_off0, bl, b_off, length, false, true);
+    } else { // if (bl.is_zero())
+      dout(20) << __func__ << " skip small zero block " << std::hex
+        << " (0x" << b_off0 << "~" << bl.length() << ")"
+        << " (0x" << b_off << "~" << length << ")"
+        << std::dec << dendl;
+      logger->inc(l_bluestore_write_small_skipped);
+      logger->inc(l_bluestore_write_small_skipped_bytes, length);
+    }
+
     return;
   }
 #endif
@@ -14481,17 +14512,29 @@ void BlueStore::_do_write_small(
 	    // due to existent extents
 	    uint64_t b_off = offset - bstart;
 	    uint64_t b_off0 = b_off;
-	    _pad_zeros(&bl, &b_off0, chunk_size);
-
-	    dout(20) << __func__ << " reuse blob " << *b << std::hex
-		     << " (0x" << b_off0 << "~" << bl.length() << ")"
-		     << " (0x" << b_off << "~" << length << ")"
-		     << std::dec << dendl;
-
 	    o->extent_map.punch_hole(c, offset, length, &wctx->old_extents);
-	    wctx->write(offset, b, alloc_len, b_off0, bl, b_off, length,
-			false, false);
-	    logger->inc(l_bluestore_write_small_unused);
+
+	    // Zero detection -- small block
+	    if (!bl.is_zero()) {
+	      _pad_zeros(&bl, &b_off0, chunk_size);
+
+	      dout(20) << __func__ << " reuse blob " << *b << std::hex
+		       << " (0x" << b_off0 << "~" << bl.length() << ")"
+		       << " (0x" << b_off << "~" << length << ")"
+		       << std::dec << dendl;
+
+	      wctx->write(offset, b, alloc_len, b_off0, bl, b_off, length,
+		  false, false);
+	      logger->inc(l_bluestore_write_small_unused);
+	    } else { // if (bl.is_zero())
+	      dout(20) << __func__ << " skip small zero block " << std::hex
+                << " (0x" << b_off0 << "~" << bl.length() << ")"
+                << " (0x" << b_off << "~" << length << ")"
+                << std::dec << dendl;
+	      logger->inc(l_bluestore_write_small_skipped);
+	      logger->inc(l_bluestore_write_small_skipped_bytes, length);
+	    }
+
 	    return;
 	  }
 	}
@@ -14529,20 +14572,32 @@ void BlueStore::_do_write_small(
 				offset0 + alloc_len, 
 				min_alloc_size)) {
 
-	  uint64_t chunk_size = b->get_blob().get_chunk_size(block_size);
 	  uint64_t b_off = offset - bstart;
 	  uint64_t b_off0 = b_off;
-	  _pad_zeros(&bl, &b_off0, chunk_size);
-
-	  dout(20) << __func__ << " reuse blob " << *b << std::hex
-		    << " (0x" << b_off0 << "~" << bl.length() << ")"
-		    << " (0x" << b_off << "~" << length << ")"
-		    << std::dec << dendl;
-
 	  o->extent_map.punch_hole(c, offset, length, &wctx->old_extents);
-	  wctx->write(offset, b, alloc_len, b_off0, bl, b_off, length,
-		      false, false);
-	  logger->inc(l_bluestore_write_small_unused);
+
+	  // Zero detection -- small block
+	  if (!bl.is_zero()) {
+	    uint64_t chunk_size = b->get_blob().get_chunk_size(block_size);
+	    _pad_zeros(&bl, &b_off0, chunk_size);
+
+	    dout(20) << __func__ << " reuse blob " << *b << std::hex
+	      << " (0x" << b_off0 << "~" << bl.length() << ")"
+	      << " (0x" << b_off << "~" << length << ")"
+	      << std::dec << dendl;
+
+	    wctx->write(offset, b, alloc_len, b_off0, bl, b_off, length,
+		false, false);
+	    logger->inc(l_bluestore_write_small_unused);
+	  } else { // if (bl.is_zero())
+	    dout(20) << __func__ << " skip small zero block " << std::hex
+	      << " (0x" << b_off0 << "~" << bl.length() << ")"
+	      << " (0x" << b_off << "~" << length << ")"
+	      << std::dec << dendl;
+	    logger->inc(l_bluestore_write_small_skipped);
+	    logger->inc(l_bluestore_write_small_skipped_bytes, length);
+	  }
+
 	  return;
 	}
       } 
@@ -14573,16 +14628,27 @@ void BlueStore::_do_write_small(
               << std::hex << offset << "~" << length
 	      << std::dec << dendl;
   }
-  // new blob.
-  BlobRef b = c->new_blob();
   uint64_t b_off = p2phase<uint64_t>(offset, alloc_len);
   uint64_t b_off0 = b_off;
-  _pad_zeros(&bl, &b_off0, block_size);
   o->extent_map.punch_hole(c, offset, length, &wctx->old_extents);
-  wctx->write(offset, b, alloc_len, b_off0, bl, b_off, length,
-    min_alloc_size != block_size, // use 'unused' bitmap when alloc granularity
-                                  // doesn't match disk one only
-    true);
+
+  // Zero detection -- small block
+  if (!bl.is_zero()) {
+    // new blob.
+    BlobRef b = c->new_blob();
+    _pad_zeros(&bl, &b_off0, block_size);
+    wctx->write(offset, b, alloc_len, b_off0, bl, b_off, length,
+	min_alloc_size != block_size, // use 'unused' bitmap when alloc granularity
+                                      // doesn't match disk one only
+	true);
+  } else { // if (bl.is_zero())
+    dout(20) << __func__ << " skip small zero block " << std::hex
+      << " (0x" << b_off0 << "~" << bl.length() << ")"
+      << " (0x" << b_off << "~" << length << ")"
+      << std::dec << dendl;
+    logger->inc(l_bluestore_write_small_skipped);
+    logger->inc(l_bluestore_write_small_skipped_bytes, length);
+  }
 
   return;
 }
@@ -14898,14 +14964,28 @@ void BlueStore::_do_write_big(
     }
     bufferlist t;
     blp.copy(l, t);
-    wctx->write(offset, b, l, b_off, t, b_off, l, false, new_blob);
-    dout(20) << __func__ << " schedule write big: 0x"
+
+    // Zero detection -- big block
+    if (!t.is_zero()) {
+      wctx->write(offset, b, l, b_off, t, b_off, l, false, new_blob);
+
+      dout(20) << __func__ << " schedule write big: 0x"
       << std::hex << offset << "~" << l << std::dec
       << (new_blob ? " new " : " reuse ")
       << *b << dendl;
+
+      logger->inc(l_bluestore_write_big_blobs);
+    } else { // if (!t.is_zero())
+      dout(20) << __func__ << " skip big zero block " << std::hex
+        << " (0x" << b_off << "~" << t.length() << ")"
+        << " (0x" << b_off << "~" << l << ")"
+        << std::dec << dendl;
+      logger->inc(l_bluestore_write_big_skipped_blobs);
+      logger->inc(l_bluestore_write_big_skipped_bytes, l);
+    }
+
     offset += l;
     length -= l;
-    logger->inc(l_bluestore_write_big_blobs);
   }
 }
 
@@ -15775,12 +15855,27 @@ int BlueStore::_truncate(TransContext *txc,
   dout(15) << __func__ << " " << c->cid << " " << o->oid
 	   << " 0x" << std::hex << offset << std::dec
 	   << dendl;
+
+  auto start_time = mono_clock::now();
   int r = 0;
   if (offset >= OBJECT_MAX_SIZE) {
     r = -E2BIG;
   } else {
     _do_truncate(txc, c, o, offset);
   }
+  log_latency_fn(
+    __func__,
+    l_bluestore_truncate_lat,
+    mono_clock::now() - start_time,
+    cct->_conf->bluestore_log_op_age,
+    [&](const ceph::timespan& lat) {
+      ostringstream ostr;
+      ostr << ", lat = " << timespan_str(lat)
+        << " cid =" << c->cid
+        << " oid =" << o->oid;
+      return ostr.str();
+    }
+  );
   dout(10) << __func__ << " " << c->cid << " " << o->oid
 	   << " 0x" << std::hex << offset << std::dec
 	   << " = " << r << dendl;
@@ -15895,9 +15990,9 @@ int BlueStore::_remove(TransContext *txc,
   dout(15) << __func__ << " " << c->cid << " " << o->oid
 	   << " onode " << o.get()
 	   << " txc "<< txc << dendl;
-
-  auto start_time = mono_clock::now();
+ auto start_time = mono_clock::now();
   int r = _do_remove(txc, c, o);
+
   log_latency_fn(
     __func__,
     l_bluestore_remove_lat,
@@ -16016,6 +16111,7 @@ void BlueStore::_do_omap_clear(TransContext *txc, OnodeRef& o)
   o->get_omap_tail(&tail);
   txc->t->rm_range_keys(omap_prefix, prefix, tail);
   txc->t->rmkey(omap_prefix, tail);
+  o->onode.clear_omap_flag();
   dout(20) << __func__ << " remove range start: "
            << pretty_binary_string(prefix) << " end: "
            << pretty_binary_string(tail) << dendl;
@@ -16026,13 +16122,16 @@ int BlueStore::_omap_clear(TransContext *txc,
 			   OnodeRef& o)
 {
   dout(15) << __func__ << " " << c->cid << " " << o->oid << dendl;
+  auto t0 = mono_clock::now();
+
   int r = 0;
   if (o->onode.has_omap()) {
     o->flush();
     _do_omap_clear(txc, o);
-    o->onode.clear_omap_flag();
     txc->write_onode(o);
   }
+  logger->tinc(l_bluestore_omap_clear_lat, mono_clock::now() - t0);
+
   dout(10) << __func__ << " " << c->cid << " " << o->oid << " = " << r << dendl;
   return r;
 }
@@ -16244,7 +16343,6 @@ int BlueStore::_clone(TransContext *txc,
     dout(20) << __func__ << " clearing old omap data" << dendl;
     newo->flush();
     _do_omap_clear(txc, newo);
-    newo->onode.clear_omap_flag();
   }
   if (oldo->onode.has_omap()) {
     dout(20) << __func__ << " copying omap data" << dendl;

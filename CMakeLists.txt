@@ -14,6 +14,9 @@ cmake_policy(SET CMP0065 NEW)
 cmake_policy(SET CMP0074 NEW)
 cmake_policy(SET CMP0075 NEW)
 cmake_policy(SET CMP0093 NEW)
+if(POLICY CMP0127)
+  cmake_policy(SET CMP0127 NEW)
+endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/modules/")
 
@@ -191,12 +194,6 @@ option(WITH_ZFS "enable LibZFS if found" OFF)
 if(WITH_ZFS)
   find_package(zfs)
   set(HAVE_LIBZFS ${ZFS_FOUND})
-endif()
-
-option(WITH_ZNS "enable zns support" OFF)
-if (WITH_ZNS)
-  # TODO: add detection, need kernel header >= 5.5
-  set(HAVE_ZNS ON)
 endif()
 
 option(WITH_BLUESTORE "Bluestore OSD backend" ON)

@@ -761,9 +761,10 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
     def update_failed_daemon_health_check(self) -> None:
         failed_daemons = []
         for dd in self.cache.get_error_daemons():
-            failed_daemons.append('daemon %s on %s is in %s state' % (
-                dd.name(), dd.hostname, dd.status_desc
-            ))
+            if dd.daemon_type != 'agent':  # agents tracked by CEPHADM_AGENT_DOWN
+                failed_daemons.append('daemon %s on %s is in %s state' % (
+                    dd.name(), dd.hostname, dd.status_desc
+                ))
         self.remove_health_warning('CEPHADM_FAILED_DAEMON')
         if failed_daemons:
             self.set_health_warning('CEPHADM_FAILED_DAEMON', f'{len(failed_daemons)} failed cephadm daemon(s)', len(
@@ -1732,9 +1733,16 @@ Then run the following:
                 continue
             if service_name is not None and service_name != nm:
                 continue
+
+            if spec.service_type != 'osd':
+                size = spec.placement.get_target_count(self.cache.get_schedulable_hosts())
+            else:
+                # osd counting is special
+                size = 0
+
             sm[nm] = orchestrator.ServiceDescription(
                 spec=spec,
-                size=spec.placement.get_target_count(self.cache.get_schedulable_hosts()),
+                size=size,
                 running=0,
                 events=self.events.get_for_service(spec.service_name()),
                 created=self.spec_store.spec_created[nm],

@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "crimson/os/seastore/logging.h"
+#include "crimson/common/config_proxy.h"
 
 // included for get_extent_by_type
 #include "crimson/os/seastore/collection_manager/collection_flat_node.h"
@@ -19,11 +20,15 @@
 
 using std::string_view;
 
+SET_SUBSYS(seastore_cache);
+
 namespace crimson::os::seastore {
 
 Cache::Cache(
   ExtentReader &reader)
-  : reader(reader)
+  : reader(reader),
+    lru(crimson::common::get_conf<Option::size_t>(
+	  "seastore_cache_lru_size"))
 {
   register_metrics();
 }
@@ -453,6 +458,20 @@ void Cache::register_metrics()
         stats.dirty_bytes,
         sm::description("total bytes of dirty extents")
       ),
+      sm::make_counter(
+	"cache_lru_size_bytes",
+	[this] {
+	  return lru.get_current_contents_bytes();
+	},
+	sm::description("total bytes pinned by the lru")
+      ),
+      sm::make_counter(
+	"cache_lru_size_extents",
+	[this] {
+	  return lru.get_current_contents_extents();
+	},
+	sm::description("total extents pinned by the lru")
+      ),
     }
   );
 
@@ -601,7 +620,7 @@ void Cache::add_extent(CachedExtentRef ref)
   if (ref->is_dirty()) {
     add_to_dirty(ref);
   } else {
-    ceph_assert(!ref->primary_ref_list_hook.is_linked());
+    touch_extent(*ref);
   }
   DEBUG("extent {}", *ref);
 }
@@ -614,6 +633,7 @@ void Cache::mark_dirty(CachedExtentRef ref)
     return;
   }
 
+  lru.remove_from_lru(*ref);
   add_to_dirty(ref);
   ref->state = CachedExtent::extent_state_t::DIRTY;
 
@@ -646,7 +666,11 @@ void Cache::remove_extent(CachedExtentRef ref)
   LOG_PREFIX(Cache::remove_extent);
   DEBUG("extent {}", *ref);
   assert(ref->is_valid());
-  remove_from_dirty(ref);
+  if (ref->is_dirty()) {
+    remove_from_dirty(ref);
+  } else {
+    lru.remove_from_lru(*ref);
+  }
   extents.erase(*ref);
 }
 
@@ -658,7 +682,12 @@ void Cache::commit_retire_extent(
   DEBUGT("extent {}", t, *ref);
   assert(ref->is_valid());
 
-  remove_from_dirty(ref);
+  // TODO: why does this duplicate remove_extent?
+  if (ref->is_dirty()) {
+    remove_from_dirty(ref);
+  } else {
+    lru.remove_from_lru(*ref);
+  }
   ref->dirty_from_or_retired_at = JOURNAL_SEQ_MAX;
 
   invalidate_extent(t, *ref);
@@ -694,6 +723,7 @@ void Cache::commit_replace_extent(
     intrusive_ptr_release(&*prev);
     intrusive_ptr_add_ref(&*next);
   } else {
+    lru.remove_from_lru(*prev);
     add_to_dirty(next);
   }
 
@@ -878,11 +908,12 @@ record_t Cache::prepare_record(Transaction &t)
   LOG_PREFIX(Cache::prepare_record);
   DEBUGT("enter", t);
 
+  auto trans_src = t.get_src();
   assert(!t.is_weak());
-  assert(t.get_src() != Transaction::src_t::READ);
+  assert(trans_src != Transaction::src_t::READ);
 
   auto& efforts = get_by_src(stats.committed_efforts_by_src,
-                             t.get_src());
+                             trans_src);
 
   // Should be valid due to interruptible future
   for (auto &i: t.read_set) {
@@ -996,7 +1027,9 @@ record_t Cache::prepare_record(Transaction &t)
 	i->get_type(),
 	i->is_logical()
 	? i->cast<LogicalCachedExtent>()->get_laddr()
-	: L_ADDR_NULL,
+	: (is_lba_node(i->get_type())
+	  ? i->cast<lba_manager::btree::LBANode>()->get_node_meta().begin
+	  : L_ADDR_NULL),
 	std::move(bl)
       });
   }
@@ -1025,51 +1058,50 @@ record_t Cache::prepare_record(Transaction &t)
   auto& ool_stats = t.get_ool_write_stats();
   ceph_assert(ool_stats.extents.num == t.ool_block_list.size());
 
-  // FIXME: prevent submitting empty records
   if (record.is_empty()) {
-    ERRORT("record is empty!", t);
+    // XXX: improve osd logic to not submit empty transactions.
+    DEBUGT("record to submit is empty, src={}!", t, trans_src);
     assert(t.onode_tree_stats.is_clear());
     assert(t.lba_tree_stats.is_clear());
     assert(ool_stats.is_clear());
-    ++(efforts.num_trans);
-  } else {
-    DEBUGT("record is ready to submit, src={}, mdsize={}, dsize={}; "
-           "{} ool records, mdsize={}, dsize={}, fillness={}",
-           t, t.get_src(),
-           record.size.get_raw_mdlength(),
-           record.size.dlength,
-           ool_stats.num_records,
-           ool_stats.header_raw_bytes,
-           ool_stats.data_bytes,
-           ((double)(ool_stats.header_raw_bytes + ool_stats.data_bytes) /
-            (ool_stats.header_bytes + ool_stats.data_bytes)));
-    if (t.get_src() == Transaction::src_t::CLEANER_TRIM ||
-        t.get_src() == Transaction::src_t::CLEANER_RECLAIM) {
-      // CLEANER transaction won't contain any onode tree operations
-      assert(t.onode_tree_stats.is_clear());
-    } else {
-      if (t.onode_tree_stats.depth) {
-        stats.onode_tree_depth = t.onode_tree_stats.depth;
-      }
-      get_by_src(stats.committed_onode_tree_efforts, t.get_src()
-          ).increment(t.onode_tree_stats);
-    }
-
-    if (t.lba_tree_stats.depth) {
-      stats.lba_tree_depth = t.lba_tree_stats.depth;
-    }
-    get_by_src(stats.committed_lba_tree_efforts, t.get_src()
-        ).increment(t.lba_tree_stats);
-
-    ++(efforts.num_trans);
-    efforts.num_ool_records += ool_stats.num_records;
-    efforts.ool_record_padding_bytes +=
-      (ool_stats.header_bytes - ool_stats.header_raw_bytes);
-    efforts.ool_record_metadata_bytes += ool_stats.header_raw_bytes;
-    efforts.ool_record_data_bytes += ool_stats.data_bytes;
-    efforts.inline_record_metadata_bytes +=
-      (record.size.get_raw_mdlength() - record.get_delta_size());
   }
+
+  DEBUGT("record is ready to submit, src={}, mdsize={}, dsize={}; "
+         "{} ool records, mdsize={}, dsize={}, fillness={}",
+         t, trans_src,
+         record.size.get_raw_mdlength(),
+         record.size.dlength,
+         ool_stats.num_records,
+         ool_stats.header_raw_bytes,
+         ool_stats.data_bytes,
+         ((double)(ool_stats.header_raw_bytes + ool_stats.data_bytes) /
+          (ool_stats.header_bytes + ool_stats.data_bytes)));
+  if (trans_src == Transaction::src_t::CLEANER_TRIM ||
+      trans_src == Transaction::src_t::CLEANER_RECLAIM) {
+    // CLEANER transaction won't contain any onode tree operations
+    assert(t.onode_tree_stats.is_clear());
+  } else {
+    if (t.onode_tree_stats.depth) {
+      stats.onode_tree_depth = t.onode_tree_stats.depth;
+    }
+    get_by_src(stats.committed_onode_tree_efforts, trans_src
+        ).increment(t.onode_tree_stats);
+  }
+
+  if (t.lba_tree_stats.depth) {
+    stats.lba_tree_depth = t.lba_tree_stats.depth;
+  }
+  get_by_src(stats.committed_lba_tree_efforts, trans_src
+      ).increment(t.lba_tree_stats);
+
+  ++(efforts.num_trans);
+  efforts.num_ool_records += ool_stats.num_records;
+  efforts.ool_record_padding_bytes +=
+    (ool_stats.header_bytes - ool_stats.header_raw_bytes);
+  efforts.ool_record_metadata_bytes += ool_stats.header_raw_bytes;
+  efforts.ool_record_data_bytes += ool_stats.data_bytes;
+  efforts.inline_record_metadata_bytes +=
+    (record.size.get_raw_mdlength() - record.get_delta_size());
 
   return record;
 }
@@ -1147,7 +1179,7 @@ void Cache::init() {
   }
   root = new RootBlock();
   root->state = CachedExtent::extent_state_t::CLEAN;
-  add_extent(root);
+  extents.insert(*root);
 }
 
 Cache::mkfs_iertr::future<> Cache::mkfs(Transaction &t)
@@ -1173,6 +1205,7 @@ Cache::close_ertr::future<> Cache::close()
     intrusive_ptr_release(ptr);
   }
   assert(stats.dirty_bytes == 0);
+  clear_lru();
   return close_ertr::now();
 }
 

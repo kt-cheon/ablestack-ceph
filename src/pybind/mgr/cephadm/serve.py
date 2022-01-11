@@ -425,7 +425,11 @@ class CephadmServe:
                                     s.get('type'), s.get('id')
                                 )
                             )
-
+                    if s.get('type') == 'tcmu-runner':
+                        # because we don't track tcmu-runner daemons in the host cache
+                        # and don't have a way to check if the daemon is part of iscsi service
+                        # we assume that all tcmu-runner daemons are managed by cephadm
+                        managed.append(name)
                     if host not in self.mgr.inventory:
                         missing_names.append(name)
                         host_num_daemons += 1
@@ -1286,6 +1290,11 @@ class CephadmServe:
                         await self._deploy_cephadm_binary(host, addr)
                         out, err, code = await self.mgr.ssh._execute_command(
                             host, cmd, stdin=stdin, addr=addr)
+                        # if there is an agent on this host, make sure it is using the most recent
+                        # vesion of cephadm binary
+                        if host in self.mgr.inventory:
+                            for agent in self.mgr.cache.get_daemons_by_type('agent', host):
+                                self.mgr._schedule_daemon_action(agent.name(), 'redeploy')
 
             except Exception as e:
                 await self.mgr.ssh._reset_con(host)

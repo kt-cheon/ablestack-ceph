@@ -111,8 +111,8 @@ public:
         return on_transaction_destruct(t);
       }
     );
-    DEBUGT("created name={}, source={}, is_weak={}",
-           *ret, name, src, is_weak);
+    SUBDEBUGT(seastore_cache, "created name={}, source={}, is_weak={}",
+              *ret, name, src, is_weak);
     return ret;
   }
 
@@ -123,7 +123,7 @@ public:
       ++(get_by_src(stats.trans_created_by_src, t.get_src()));
     }
     t.reset_preserve_handle(last_commit);
-    DEBUGT("reset", t);
+    SUBDEBUGT(seastore_cache, "reset", t);
   }
 
   /**
@@ -255,7 +255,7 @@ public:
     auto result = t.get_extent(offset, &ret);
     if (result != Transaction::get_extent_ret::ABSENT) {
       // including get_extent_ret::RETIRED
-      DEBUGT(
+      SUBDEBUGT(seastore_cache,
 	"Found extent at offset {} on transaction: {}",
 	t, offset, *ret);
       return get_extent_if_cached_iertr::make_ready_future<
@@ -268,7 +268,7 @@ public:
     if (!ret ||
         // retired_placeholder is not really cached yet
         ret->get_type() == extent_types_t::RETIRED_PLACEHOLDER) {
-      DEBUGT(
+      SUBDEBUGT(seastore_cache,
 	"No extent at offset {}, retired_placeholder: {}",
 	t, offset, !!ret);
       return get_extent_if_cached_iertr::make_ready_future<
@@ -276,10 +276,11 @@ public:
     }
 
     // present in cache and is not a retired_placeholder
-    DEBUGT(
+    SUBDEBUGT(seastore_cache,
       "Found extent at offset {} in cache: {}",
       t, offset, *ret);
     t.add_to_read_set(ret);
+    touch_extent(*ret);
     return ret->wait_io().then([ret] {
       return get_extent_if_cached_iertr::make_ready_future<
         CachedExtentRef>(ret);
@@ -308,7 +309,7 @@ public:
     auto result = t.get_extent(offset, &ret);
     if (result != Transaction::get_extent_ret::ABSENT) {
       assert(result != Transaction::get_extent_ret::RETIRED);
-      DEBUGT(
+      SUBDEBUGT(seastore_cache,
 	"Found extent at offset {} on transaction: {}",
 	t, offset, *ret);
       return seastar::make_ready_future<TCachedExtentRef<T>>(
@@ -322,14 +323,15 @@ public:
       ).si_then([this, FNAME, offset, &t](auto ref) {
 	(void)this; // silence incorrect clang warning about capture
 	if (!ref->is_valid()) {
-	  DEBUGT("got invalid extent: {}", t, ref);
+	  SUBDEBUGT(seastore_cache, "got invalid extent: {}", t, ref);
 	  ++(get_by_src(stats.trans_conflicts_by_unknown, t.get_src()));
 	  mark_transaction_conflicted(t, *ref);
 	  return get_extent_iertr::make_ready_future<TCachedExtentRef<T>>();
 	} else {
-	  DEBUGT(
+	  SUBDEBUGT(seastore_cache,
 	    "Read extent at offset {} in cache: {}",
 	    t, offset, *ref);
+	  touch_extent(*ref);
 	  t.add_to_read_set(ref);
 	  return get_extent_iertr::make_ready_future<TCachedExtentRef<T>>(
 	    std::move(ref));
@@ -413,11 +415,12 @@ private:
       ).si_then([=, &t](CachedExtentRef ret) {
         if (!ret->is_valid()) {
           LOG_PREFIX(Cache::get_extent_by_type);
-          DEBUGT("got invalid extent: {}", t, ret);
+          SUBDEBUGT(seastore_cache, "got invalid extent: {}", t, ret);
           ++(get_by_src(stats.trans_conflicts_by_unknown, t.get_src()));
           mark_transaction_conflicted(t, *ret.get());
           return get_extent_ertr::make_ready_future<CachedExtentRef>();
         } else {
+	  touch_extent(*ret);
           t.add_to_read_set(ret);
           return get_extent_ertr::make_ready_future<CachedExtentRef>(
             std::move(ret));
@@ -472,6 +475,10 @@ public:
     t.add_fresh_extent(ret, delayed);
     ret->state = CachedExtent::extent_state_t::INITIAL_WRITE_PENDING;
     return ret;
+  }
+
+  void clear_lru() {
+    lru.clear();
   }
 
   void mark_delayed_extent_inline(
@@ -698,6 +705,93 @@ private:
    */
   CachedExtent::list dirty;
 
+  /**
+   * lru
+   *
+   * holds references to recently used extents
+   */
+  class LRU {
+    // max size (bytes)
+    const size_t capacity = 0;
+
+    // current size (bytes)
+    size_t contents = 0;
+
+    CachedExtent::list lru;
+
+    void trim_to_capacity() {
+      while (contents > capacity) {
+	assert(lru.size() > 0);
+	remove_from_lru(lru.front());
+      }
+    }
+
+    void add_to_lru(CachedExtent &extent) {
+      assert(
+	extent.is_clean() &&
+	!extent.is_pending() &&
+	!extent.is_placeholder());
+      
+      if (!extent.primary_ref_list_hook.is_linked()) {
+	contents += extent.get_length();
+	intrusive_ptr_add_ref(&extent);
+	lru.push_back(extent);
+      }
+      trim_to_capacity();
+    }
+
+  public:
+    LRU(size_t capacity) : capacity(capacity) {}
+
+    size_t get_current_contents_bytes() const {
+      return contents;
+    }
+
+    size_t get_current_contents_extents() const {
+      return lru.size();
+    }
+
+    void remove_from_lru(CachedExtent &extent) {
+      assert(extent.is_clean());
+      assert(!extent.is_pending());
+      assert(!extent.is_placeholder());
+
+      if (extent.primary_ref_list_hook.is_linked()) {
+	lru.erase(lru.s_iterator_to(extent));
+	assert(contents >= extent.get_length());
+	contents -= extent.get_length();
+	intrusive_ptr_release(&extent);
+      }
+    }
+
+    void move_to_top(CachedExtent &extent) {
+      assert(
+	extent.is_clean() &&
+	!extent.is_pending() &&
+	!extent.is_placeholder());
+
+      if (extent.primary_ref_list_hook.is_linked()) {
+	lru.erase(lru.s_iterator_to(extent));
+	intrusive_ptr_release(&extent);
+	assert(contents >= extent.get_length());
+	contents -= extent.get_length();
+      }
+      add_to_lru(extent);
+    }
+
+    void clear() {
+      LOG_PREFIX(Cache::LRU::clear);
+      for (auto iter = lru.begin(); iter != lru.end();) {
+	SUBDEBUG(seastore_cache, "clearing {}", *iter);
+	remove_from_lru(*(iter++));
+      }
+    }
+
+    ~LRU() {
+      clear();
+    }
+  } lru;
+
   struct query_counters_t {
     uint64_t access = 0;
     uint64_t hit = 0;
@@ -848,6 +942,14 @@ private:
       buffer::create_page_aligned(size));
     bp.zero();
     return bp;
+  }
+
+  /// Update lru for access to ref
+  void touch_extent(CachedExtent &ext) {
+    assert(!ext.is_pending());
+    if (ext.is_clean() && !ext.is_placeholder()) {
+      lru.move_to_top(ext);
+    }
   }
 
   /// Add extent to extents handling dirty and refcounting

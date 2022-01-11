@@ -11,7 +11,7 @@ from prettytable import PrettyTable
 from ceph.deployment.inventory import Device
 from ceph.deployment.drive_group import DriveGroupSpec, DeviceSelection, OSDMethod
 from ceph.deployment.service_spec import PlacementSpec, ServiceSpec, service_spec_allow_invalid_from_json, \
-    SNMPGatewaySpec, SNMPVersion, SNMPAuthType, SNMPPrivacyType
+    SNMPGatewaySpec
 from ceph.deployment.hostspec import SpecValidationError
 from ceph.utils import datetime_now
 
@@ -371,10 +371,20 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
         return HandleCommandResult(stdout=completion.result_str())
 
     @_cli_read_command('orch host ls')
-    def _get_hosts(self, format: Format = Format.plain) -> HandleCommandResult:
+    def _get_hosts(self, format: Format = Format.plain, host_pattern: str = '', label: str = '', host_status: str = '') -> HandleCommandResult:
         """List hosts"""
         completion = self.get_hosts()
         hosts = raise_if_exception(completion)
+
+        filter_spec = PlacementSpec(
+            host_pattern=host_pattern,
+            label=label
+        )
+        filtered_hosts: List[str] = filter_spec.filter_matching_hostspecs(hosts)
+        hosts = [h for h in hosts if h.hostname in filtered_hosts]
+
+        if host_status:
+            hosts = [h for h in hosts if h.status.lower() == host_status]
 
         if format != Format.plain:
             output = to_format(hosts, format, many=True, cls=HostSpec)
@@ -389,6 +399,14 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
                 table.add_row((host.hostname, host.addr, ' '.join(
                     host.labels), host.status.capitalize()))
             output = table.get_string()
+        if format == Format.plain:
+            output += f'\n{len(hosts)} hosts in cluster'
+            if label:
+                output += f' who had label {label}'
+            if host_pattern:
+                output += f' whose hostname matched {host_pattern}'
+            if host_status:
+                output += f' with status {host_status}'
         return HandleCommandResult(stdout=output)
 
     @_cli_write_command('orch host label add')
@@ -1151,12 +1169,12 @@ Usage:
 
     @_cli_write_command('orch apply snmp-gateway')
     def _apply_snmp_gateway(self,
-                            snmp_version: SNMPVersion,
+                            snmp_version: SNMPGatewaySpec.SNMPVersion,
                             destination: str,
-                            port: int = 9464,
+                            port: Optional[int] = None,
                             engine_id: Optional[str] = None,
-                            auth_protocol: Optional[SNMPAuthType] = None,
-                            privacy_protocol: Optional[SNMPPrivacyType] = None,
+                            auth_protocol: Optional[SNMPGatewaySpec.SNMPAuthType] = None,
+                            privacy_protocol: Optional[SNMPGatewaySpec.SNMPPrivacyType] = None,
                             placement: Optional[str] = None,
                             unmanaged: bool = False,
                             dry_run: bool = False,
@@ -1175,17 +1193,14 @@ Usage:
         except (OSError, yaml.YAMLError):
             raise OrchestratorValidationError('credentials file must be valid YAML')
 
-        auth = None if not auth_protocol else auth_protocol.value
-        priv = None if not privacy_protocol else privacy_protocol.value
-
         spec = SNMPGatewaySpec(
-            snmp_version=snmp_version.value,
+            snmp_version=snmp_version,
             port=port,
             credentials=credentials,
             snmp_destination=destination,
             engine_id=engine_id,
-            auth_protocol=auth,
-            privacy_protocol=priv,
+            auth_protocol=auth_protocol,
+            privacy_protocol=privacy_protocol,
             placement=PlacementSpec.from_string(placement),
             unmanaged=unmanaged,
             preview_only=dry_run

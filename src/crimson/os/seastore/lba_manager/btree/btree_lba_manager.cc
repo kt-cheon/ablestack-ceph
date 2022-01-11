@@ -15,9 +15,11 @@
 
 namespace {
   seastar::logger& logger() {
-    return crimson::get_logger(ceph_subsys_seastore);
+    return crimson::get_logger(ceph_subsys_seastore_lba);
   }
 }
+
+SET_SUBSYS(seastore_lba);
 
 namespace crimson::os::seastore::lba_manager::btree {
 
@@ -183,12 +185,6 @@ BtreeLBAManager::alloc_extent(
     }).si_then([](auto &&state) {
       return state.ret->get_pin();
     });
-}
-
-static bool is_lba_node(extent_types_t type)
-{
-  return type == extent_types_t::LADDR_INTERNAL ||
-    type == extent_types_t::LADDR_LEAF;
 }
 
 static bool is_lba_node(const CachedExtent &e)

@@ -556,6 +556,7 @@ MDSRank::~MDSRank()
 {
   if (hb) {
     g_ceph_context->get_heartbeat_map()->remove_worker(hb);
+    hb = nullptr;
   }
 
   if (scrubstack) { delete scrubstack; scrubstack = NULL; }
@@ -3748,6 +3749,7 @@ const char** MDSRankDispatcher::get_tracked_conf_keys() const
     "mds_cap_acquisition_throttle_retry_request_time",
     "mds_alternate_name_max",
     "mds_dir_max_entries",
+    "mds_symlink_recovery",
     NULL
   };
   return KEYS;
