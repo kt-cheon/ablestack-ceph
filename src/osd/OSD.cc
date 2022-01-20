@@ -3897,7 +3897,7 @@ void OSD::final_init()
   ceph_assert(r == 0);
   r = admin_socket->register_command("dump_op_pq_state",
 				     asok_hook,
-				     "dump op priority queue state");
+				     "dump op queue state");
   ceph_assert(r == 0);
   r = admin_socket->register_command("dump_blocklist",
 				     asok_hook,
@@ -7647,6 +7647,15 @@ vector<DaemonHealthMetric> OSD::get_health_metrics()
     too_old -= cct->_conf.get_val<double>("osd_op_complaint_time");
     int slow = 0;
     TrackedOpRef oldest_op;
+    OSDMapRef osdmap = get_osdmap();
+    // map of slow op counts by slow op event type for an aggregated logging to
+    // the cluster log.
+    map<uint8_t, int> slow_op_types;
+    // map of slow op counts by pool for reporting a pool name with highest
+    // slow ops.
+    map<uint64_t, int> slow_op_pools;
+    bool log_aggregated_slow_op =
+	    cct->_conf.get_val<bool>("osd_aggregated_slow_ops_logging");
     auto count_slow_ops = [&](TrackedOp& op) {
       if (op.get_initiated() < too_old) {
         stringstream ss;
@@ -7656,7 +7665,19 @@ vector<DaemonHealthMetric> OSD::get_health_metrics()
            << " currently "
            << op.state_string();
         lgeneric_subdout(cct,osd,20) << ss.str() << dendl;
-        clog->warn() << ss.str();
+        if (log_aggregated_slow_op) {
+          if (const OpRequest *req = dynamic_cast<const OpRequest *>(&op)) {
+            uint8_t op_type = req->state_flag();
+            auto m = req->get_req<MOSDFastDispatchOp>();
+            uint64_t poolid = m->get_spg().pgid.m_pool;
+            slow_op_types[op_type]++;
+            if (poolid > 0 && poolid <= (uint64_t) osdmap->get_pool_max()) {
+              slow_op_pools[poolid]++;
+            }
+          }
+        } else {
+          clog->warn() << ss.str();
+        }
 	slow++;
 	if (!oldest_op || op.get_initiated() < oldest_op->get_initiated()) {
 	  oldest_op = &op;
@@ -7670,6 +7691,32 @@ vector<DaemonHealthMetric> OSD::get_health_metrics()
       if (slow) {
 	derr << __func__ << " reporting " << slow << " slow ops, oldest is "
 	     << oldest_op->get_desc() << dendl;
+        if (log_aggregated_slow_op &&
+             slow_op_types.size() > 0) {
+          stringstream ss;
+          ss << slow << " slow requests (by type [ ";
+          for (const auto& [op_type, count] : slow_op_types) {
+            ss << "'" << OpRequest::get_state_string(op_type)
+               << "' : " << count
+               << " ";
+          }
+          auto slow_pool_it = std::max_element(slow_op_pools.begin(), slow_op_pools.end(),
+                                 [](std::pair<uint64_t, int> p1, std::pair<uint64_t, int> p2) {
+                                   return p1.second < p2.second;
+                                 });
+          if (osdmap->get_pools().find(slow_pool_it->first) != osdmap->get_pools().end()) {
+            string pool_name = osdmap->get_pool_name(slow_pool_it->first);
+            ss << "] most affected pool [ '"
+               << pool_name
+               << "' : "
+               << slow_pool_it->second
+               << " ])";
+          } else {
+            ss << "])";
+          }
+          lgeneric_subdout(cct,osd,20) << ss.str() << dendl;
+          clog->warn() << ss.str();
+        }
       }
       metrics.emplace_back(daemon_metric::SLOW_OPS, slow, oldest_secs);
     } else {
@@ -9957,7 +10004,8 @@ void OSD::maybe_override_max_osd_capacity_for_qos()
   // osd capacity with the value obtained from running the
   // osd bench test. This is later used to setup mclock.
   if ((cct->_conf.get_val<std::string>("osd_op_queue") == "mclock_scheduler") &&
-      (cct->_conf.get_val<bool>("osd_mclock_skip_benchmark") == false)) {
+      (cct->_conf.get_val<bool>("osd_mclock_skip_benchmark") == false) &&
+      (!unsupported_objstore_for_qos())) {
     std::string max_capacity_iops_config;
     bool force_run_benchmark =
       cct->_conf.get_val<bool>("osd_mclock_force_run_benchmark_on_init");
@@ -10041,7 +10089,8 @@ bool OSD::maybe_override_options_for_qos()
 {
   // If the scheduler enabled is mclock, override the recovery, backfill
   // and sleep options so that mclock can meet the QoS goals.
-  if (cct->_conf.get_val<std::string>("osd_op_queue") == "mclock_scheduler") {
+  if (cct->_conf.get_val<std::string>("osd_op_queue") == "mclock_scheduler" &&
+      !unsupported_objstore_for_qos()) {
     dout(1) << __func__
             << ": Changing recovery/backfill/sleep settings for QoS" << dendl;
 
@@ -10109,6 +10158,14 @@ int OSD::mon_cmd_set_config(const std::string &key, const std::string &val)
   }
 
   return 0;
+}
+
+bool OSD::unsupported_objstore_for_qos()
+{
+  static const std::vector<std::string> unsupported_objstores = { "filestore" };
+  return std::find(unsupported_objstores.begin(),
+                   unsupported_objstores.end(),
+                   store->get_type()) != unsupported_objstores.end();
 }
 
 void OSD::update_log_config()
@@ -10608,6 +10665,13 @@ void OSDShard::update_scheduler_config()
   scheduler->update_configuration();
 }
 
+std::string OSDShard::get_scheduler_type()
+{
+  std::ostringstream scheduler_type;
+  scheduler_type << *scheduler;
+  return scheduler_type.str();
+}
+
 OSDShard::OSDShard(
   int id,
   CephContext *cct,
@@ -10622,7 +10686,8 @@ OSDShard::OSDShard(
     shard_lock_name(shard_name + "::shard_lock"),
     shard_lock{make_mutex(shard_lock_name)},
     scheduler(ceph::osd::scheduler::make_scheduler(
-      cct, osd->num_shards, osd->store->is_rotational())),
+      cct, osd->num_shards, osd->store->is_rotational(),
+      osd->store->get_type())),
     context_queue(sdata_wait_lock, sdata_cond)
 {
   dout(0) << "using op scheduler " << *scheduler << dendl;
@@ -10996,10 +11061,13 @@ void OSD::ShardedOpWQ::_enqueue(OpSchedulerItem&& item) {
   uint32_t shard_index =
     item.get_ordering_token().hash_to_shard(osd->shards.size());
 
-  dout(20) << __func__ << " " << item << dendl;
-
   OSDShard* sdata = osd->shards[shard_index];
   assert (NULL != sdata);
+  if (sdata->get_scheduler_type() == "mClockScheduler") {
+    item.maybe_set_is_qos_item();
+  }
+
+  dout(20) << __func__ << " " << item << dendl;
 
   bool empty = true;
   {

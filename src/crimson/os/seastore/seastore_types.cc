@@ -6,13 +6,18 @@
 
 namespace {
 
-seastar::logger& logger() {
-  return crimson::get_logger(ceph_subsys_seastore_tm);
+seastar::logger& journal_logger() {
+  return crimson::get_logger(ceph_subsys_seastore_journal);
 }
 
 }
 
 namespace crimson::os::seastore {
+
+std::ostream& operator<<(std::ostream& out, const seastore_meta_t& meta)
+{
+  return out << meta.seastore_id;
+}
 
 std::ostream &segment_to_stream(std::ostream &out, const segment_id_t &t)
 {
@@ -64,10 +69,10 @@ std::ostream &operator<<(std::ostream &out, const paddr_t &rhs)
 
 std::ostream &operator<<(std::ostream &out, const journal_seq_t &seq)
 {
-  return out << "journal_seq_t(segment_seq="
-	     << seq.segment_seq << ", offset="
-	     << seq.offset
-	     << ")";
+  return out << "journal_seq_t("
+             << "segment_seq=" << seq.segment_seq
+             << ", offset=" << seq.offset
+             << ")";
 }
 
 std::ostream &operator<<(std::ostream &out, extent_types_t t)
@@ -147,7 +152,7 @@ std::ostream &operator<<(std::ostream &out, const segment_header_t &header)
 {
   return out << "segment_header_t("
 	     << "segment_seq=" << header.journal_segment_seq
-	     << ", physical_segment_id=" << header.physical_segment_id
+	     << ", segment_id=" << header.physical_segment_id
 	     << ", journal_tail=" << header.journal_tail
 	     << ", segment_nonce=" << header.segment_nonce
 	     << ", out-of-line=" << header.out_of_line
@@ -174,6 +179,34 @@ void record_size_t::account(const delta_info_t& delta)
   plain_mdlength += ceph::encoded_sizeof(delta);
 }
 
+std::ostream &operator<<(std::ostream& out, const record_size_t& rsize)
+{
+  return out << "record_size_t("
+             << "raw_md=" << rsize.get_raw_mdlength()
+             << ", data=" << rsize.dlength
+             << ")";
+}
+
+std::ostream &operator<<(std::ostream& out, const record_t& r)
+{
+  return out << "record_t("
+             << "num_extents=" << r.extents.size()
+             << ", num_deltas=" << r.deltas.size()
+             << ")";
+}
+
+std::ostream& operator<<(std::ostream& out, const record_group_header_t& h)
+{
+  return out << "record_group_header_t("
+             << "num_records=" << h.records
+             << ", mdlength=" << h.mdlength
+             << ", dlength=" << h.dlength
+             << ", nonce=" << h.segment_nonce
+             << ", committed_to=" << h.committed_to
+             << ", data_crc=" << h.data_crc
+             << ")";
+}
+
 extent_len_t record_group_size_t::get_raw_mdlength() const
 {
   return plain_mdlength +
@@ -192,6 +225,24 @@ void record_group_size_t::account(
   plain_mdlength += rsize.get_raw_mdlength();
   dlength += rsize.dlength;
   block_size = _block_size;
+}
+
+std::ostream& operator<<(std::ostream& out, const record_group_size_t& size)
+{
+  return out << "record_group_size_t("
+             << "raw_md=" << size.get_raw_mdlength()
+             << ", data=" << size.dlength
+             << ", block_size=" << size.block_size
+             << ", fullness=" << size.get_fullness()
+             << ")";
+}
+
+std::ostream& operator<<(std::ostream& out, const record_group_t& rg)
+{
+  return out << "record_group_t("
+             << "num_records=" << rg.records.size()
+             << ", " << rg.size
+             << ")";
 }
 
 ceph::bufferlist encode_record(
@@ -292,14 +343,14 @@ try_decode_records_header(
   try {
     decode(header, bp);
   } catch (ceph::buffer::error &e) {
-    logger().debug(
+    journal_logger().debug(
         "try_decode_records_header: failed, "
         "cannot decode record_group_header_t, got {}.",
         e);
     return std::nullopt;
   }
   if (header.segment_nonce != expected_nonce) {
-    logger().debug(
+    journal_logger().debug(
         "try_decode_records_header: failed, record_group_header nonce mismatch, "
         "read {}, expected {}!",
         header.segment_nonce,
@@ -324,7 +375,8 @@ bool validate_records_metadata(
     test_crc);
   bool success = (test_crc == recorded_crc);
   if (!success) {
-    logger().debug("validate_records_metadata: failed, metadata crc mismatch.");
+    journal_logger().debug(
+        "validate_records_metadata: failed, metadata crc mismatch.");
   }
   return success;
 }
@@ -335,7 +387,8 @@ bool validate_records_data(
 {
   bool success = (data_bl.crc32c(-1) == header.data_crc);
   if (!success) {
-    logger().debug("validate_records_data: failed, data crc mismatch!");
+    journal_logger().debug(
+        "validate_records_data: failed, data crc mismatch!");
   }
   return success;
 }
@@ -355,7 +408,7 @@ try_decode_record_headers(
     try {
       decode(i, bliter);
     } catch (ceph::buffer::error &e) {
-      logger().debug(
+      journal_logger().debug(
           "try_decode_record_headers: failed, "
           "cannot decode record_header_t, got {}.",
           e);
@@ -374,8 +427,6 @@ try_decode_extent_infos(
 {
   auto maybe_headers = try_decode_record_headers(header, md_bl);
   if (!maybe_headers) {
-    logger().debug(
-        "try_decode_extent_infos: failed, cannot decode record headers.");
     return std::nullopt;
   }
 
@@ -395,7 +446,7 @@ try_decode_extent_infos(
       try {
         decode(i, bliter);
       } catch (ceph::buffer::error &e) {
-        logger().debug(
+        journal_logger().debug(
             "try_decode_extent_infos: failed, "
             "cannot decode extent_info_t, got {}.",
             e);
@@ -415,8 +466,6 @@ try_decode_deltas(
 {
   auto maybe_record_extent_infos = try_decode_extent_infos(header, md_bl);
   if (!maybe_record_extent_infos) {
-    logger().debug(
-        "try_decode_deltas: failed, cannot decode extent_infos.");
     return std::nullopt;
   }
 
@@ -440,7 +489,7 @@ try_decode_deltas(
       try {
         decode(i, bliter);
       } catch (ceph::buffer::error &e) {
-        logger().debug(
+        journal_logger().debug(
             "try_decode_deltas: failed, "
             "cannot decode delta_info_t, got {}.",
             e);
@@ -458,7 +507,7 @@ try_decode_deltas(
 
 bool can_delay_allocation(device_type_t type) {
   // Some types of device may not support delayed allocation, for example PMEM.
-  return type <= RANDOM_BLOCK;
+  return type <= device_type_t::RANDOM_BLOCK;
 }
 
 device_type_t string_to_device_type(std::string type) {
@@ -474,18 +523,22 @@ device_type_t string_to_device_type(std::string type) {
   return device_type_t::NONE;
 }
 
-std::string device_type_to_string(device_type_t dtype) {
-  switch (dtype) {
+std::ostream& operator<<(std::ostream& out, device_type_t t)
+{
+  switch (t) {
+  case device_type_t::NONE:
+    return out << "NONE";
   case device_type_t::SEGMENTED:
-    return "segmented";
+    return out << "SEGMENTED";
   case device_type_t::RANDOM_BLOCK:
-    return "random_block";
+    return out << "RANDOM_BLOCK";
   case device_type_t::PMEM:
-    return "pmem";
+    return out << "PMEM";
   default:
-    ceph_assert(0 == "impossible");
+    return out << "INVALID_DEVICE_TYPE!";
   }
 }
+
 paddr_t convert_blk_paddr_to_paddr(blk_paddr_t addr, size_t block_size,
     uint32_t blocks_per_segment, device_id_t d_id)
 {
@@ -505,5 +558,46 @@ blk_paddr_t convert_paddr_to_blk_paddr(paddr_t addr, size_t block_size,
 	  (block_size * blocks_per_segment) + s.get_segment_off());
 }
 
+std::ostream& operator<<(std::ostream& out, const write_result_t& w)
+{
+  return out << "write_result_t("
+             << "start=" << w.start_seq
+             << ", length=" << w.length
+             << ")";
+}
+
+std::ostream& operator<<(std::ostream& out, const record_locator_t& l)
+{
+  return out << "record_locator_t("
+             << "block_base=" << l.record_block_base
+             << ", " << l.write_result
+             << ")";
+}
+
+void scan_valid_records_cursor::emplace_record_group(
+    const record_group_header_t& header, ceph::bufferlist&& md_bl)
+{
+  auto new_committed_to = header.committed_to;
+  ceph_assert(last_committed == journal_seq_t() ||
+              last_committed <= new_committed_to);
+  last_committed = new_committed_to;
+  pending_record_groups.emplace_back(
+    seq.offset,
+    header,
+    std::move(md_bl));
+  increment_seq(header.dlength + header.mdlength);
+  ceph_assert(new_committed_to == journal_seq_t() ||
+              new_committed_to < seq);
+}
+
+std::ostream& operator<<(std::ostream& out, const scan_valid_records_cursor& c)
+{
+  return out << "cursor(last_valid_header_found=" << c.last_valid_header_found
+             << ", seq=" << c.seq
+             << ", last_committed=" << c.last_committed
+             << ", pending_record_groups=" << c.pending_record_groups.size()
+             << ", num_consumed_records=" << c.num_consumed_records
+             << ")";
+}
 
 }
