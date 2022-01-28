@@ -378,10 +378,10 @@ public:
    * Checks whether e is live (reachable from lba tree) and drops or initializes
    * accordingly.
    *
-   * Returns e if live and a null CachedExtentRef otherwise.
+   * Returns if e is live.
    */
   using init_cached_extent_iertr = base_iertr;
-  using init_cached_extent_ret = init_cached_extent_iertr::future<CachedExtentRef>;
+  using init_cached_extent_ret = init_cached_extent_iertr::future<bool>;
   init_cached_extent_ret init_cached_extent(op_context_t c, CachedExtentRef e);
 
   /// get_leaf_if_live: get leaf node at laddr/addr if still live
@@ -391,7 +391,7 @@ public:
     op_context_t c,
     paddr_t addr,
     laddr_t laddr,
-    segment_off_t len);
+    seastore_off_t len);
 
   /// get_internal_if_live: get internal node at laddr/addr if still live
   using get_internal_if_live_iertr = base_iertr;
@@ -400,7 +400,7 @@ public:
     op_context_t c,
     paddr_t addr,
     laddr_t laddr,
-    segment_off_t len);
+    seastore_off_t len);
 
   /**
    * rewrite_lba_extent

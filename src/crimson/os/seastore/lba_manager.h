@@ -118,9 +118,11 @@ public:
    * Implementation must initialize the LBAPin on any
    * LogicalCachedExtent's and may also read in any dependent
    * structures, etc.
+   *
+   * @return returns whether the extent is alive
    */
   using init_cached_extent_iertr = base_iertr;
-  using init_cached_extent_ret = init_cached_extent_iertr::future<>;
+  using init_cached_extent_ret = init_cached_extent_iertr::future<bool>;
   virtual init_cached_extent_ret init_cached_extent(
     Transaction &t,
     CachedExtentRef e) = 0;
@@ -190,7 +192,7 @@ public:
     extent_types_t type,
     paddr_t addr,
     laddr_t laddr,
-    segment_off_t len) = 0;
+    seastore_off_t len) = 0;
 
   virtual void add_pin(LBAPin &pin) = 0;
 

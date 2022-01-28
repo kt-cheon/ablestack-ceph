@@ -126,6 +126,7 @@ BtreeLBAManager::alloc_extent(
   extent_len_t len,
   paddr_t addr)
 {
+  ceph_assert(is_aligned(hint, (uint64_t)segment_manager.get_block_size()));
   struct state_t {
     laddr_t last_end;
 
@@ -266,14 +267,17 @@ BtreeLBAManager::init_cached_extent_ret BtreeLBAManager::init_cached_extent(
 {
   LOG_PREFIX(BtreeLBAManager::init_cached_extent);
   DEBUGT("extent {}", t, *e);
-  auto c = get_context(t);
-  return with_btree(
-    c,
-    [c, e](auto &btree) {
-      return btree.init_cached_extent(
-	c, e
-      ).si_then([](auto) {});
+  return seastar::do_with(bool(), [this, e, &t](bool& ret) {
+    auto c = get_context(t);
+    return with_btree(c, [c, e, &ret](auto &btree) {
+      return btree.init_cached_extent(c, e
+      ).si_then([&ret](bool is_alive) {
+        ret = is_alive;
+      });
+    }).si_then([&ret] {
+      return ret;
     });
+  });
 }
 
 BtreeLBAManager::scan_mappings_ret BtreeLBAManager::scan_mappings(
@@ -402,7 +406,7 @@ BtreeLBAManager::get_physical_extent_if_live(
   extent_types_t type,
   paddr_t addr,
   laddr_t laddr,
-  segment_off_t len)
+  seastore_off_t len)
 {
   ceph_assert(is_lba_node(type));
   auto c = get_context(t);
