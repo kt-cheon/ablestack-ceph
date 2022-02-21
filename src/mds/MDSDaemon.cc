@@ -262,6 +262,10 @@ void MDSDaemon::set_up_admin_socket()
       asok_hook,
       "show the blocked ops currently in flight");
   ceph_assert(r == 0);
+  r = admin_socket->register_command("dump_blocked_ops_count", 
+      asok_hook,
+      "show the count of blocked ops currently in flight");
+  ceph_assert(r == 0);
   r = admin_socket->register_command("dump_historic_ops",
 				     asok_hook,
 				     "show recent ops");
@@ -1037,6 +1041,9 @@ void MDSDaemon::ms_handle_remote_reset(Connection *con)
       dout(3) << "ms_handle_remote_reset closing connection for session " << session->info.inst << dendl;
       con->mark_down();
       con->set_priv(nullptr);
+    } else if (session->is_open()) {
+      dout(3) << "ms_handle_remote_reset kill session " << session->info.inst << dendl;
+      mds_rank->server->kill_session(session, nullptr);
     }
   }
 }

@@ -721,8 +721,7 @@ void cls_rgw_reshard_entry::dump(Formatter *f) const
   encode_json("bucket_id", bucket_id, f);
   encode_json("new_instance_id", new_instance_id, f);
   encode_json("old_num_shards", old_num_shards, f);
-  encode_json("new_num_shards", new_num_shards, f);
-
+  encode_json("tentative_new_num_shards", new_num_shards, f);
 }
 
 void cls_rgw_reshard_entry::generate_test_instances(list<cls_rgw_reshard_entry*>& ls)
@@ -754,7 +753,18 @@ void cls_rgw_bucket_instance_entry::generate_test_instances(
   ls.back()->reshard_status = RESHARD_STATUS::IN_PROGRESS;
   ls.back()->new_bucket_instance_id = "new_instance_id";
 }
-  
+
+void cls_rgw_lc_entry::dump(Formatter *f) const
+{
+  encode_json("bucket", bucket, f);
+  encode_json("start_time", start_time, f);
+  encode_json("status", status, f);
+}
+
+void generate_test_instances(list<cls_rgw_lc_entry*>& ls)
+{
+}
+
 void cls_rgw_lc_obj_head::dump(Formatter *f) const 
 {
   encode_json("start_date", start_date, f);

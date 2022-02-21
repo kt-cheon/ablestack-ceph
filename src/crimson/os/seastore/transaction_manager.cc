@@ -46,10 +46,12 @@ TransactionManager::mkfs_ertr::future<> TransactionManager::mkfs()
 {
   LOG_PREFIX(TransactionManager::mkfs);
   INFO("enter");
-  segment_cleaner->mount(
+  return segment_cleaner->mount(
     segment_manager.get_device_id(),
-    scanner.get_segment_managers());
-  return journal->open_for_write().safe_then([this, FNAME](auto addr) {
+    scanner.get_segment_managers()
+  ).safe_then([this] {
+    return journal->open_for_write();
+  }).safe_then([this, FNAME](auto addr) {
     segment_cleaner->init_mkfs(addr);
     return with_transaction_intr(
       Transaction::src_t::MUTATE,
@@ -83,22 +85,20 @@ TransactionManager::mount_ertr::future<> TransactionManager::mount()
   LOG_PREFIX(TransactionManager::mount);
   INFO("enter");
   cache->init();
-  segment_cleaner->mount(
+  return segment_cleaner->mount(
     segment_manager.get_device_id(),
-    scanner.get_segment_managers());
-  return segment_cleaner->init_segments().safe_then(
-    [this](auto&& segments) {
+    scanner.get_segment_managers()
+  ).safe_then([this] {
     return journal->replay(
-      std::move(segments),
       [this](const auto &offsets, const auto &e) {
-      auto start_seq = offsets.write_result.start_seq;
-      segment_cleaner->update_journal_tail_target(
-          cache->get_oldest_dirty_from().value_or(start_seq));
-      return cache->replay_delta(
-          start_seq,
-          offsets.record_block_base,
-          e);
-    });
+	auto start_seq = offsets.write_result.start_seq;
+	segment_cleaner->update_journal_tail_target(
+	  cache->get_oldest_dirty_from().value_or(start_seq));
+	return cache->replay_delta(
+	  start_seq,
+	  offsets.record_block_base,
+	  e);
+      });
   }).safe_then([this] {
     return journal->open_for_write();
   }).safe_then([this, FNAME](auto addr) {
@@ -285,12 +285,29 @@ TransactionManager::submit_transaction_direct(
   return trans_intr::make_interruptible(
     tref.get_handle().enter(write_pipeline.ool_writes)
   ).then_interruptible([this, FNAME, &tref] {
-    SUBTRACET(seastore_t, "process delayed and out-of-line extents", tref);
-    return epm->delayed_alloc_or_ool_write(tref
-    ).handle_error_interruptible(
-      crimson::ct_error::input_output_error::pass_further(),
-      crimson::ct_error::assert_all("invalid error")
-    );
+    auto delayed_extents = tref.get_delayed_alloc_list();
+    auto num_extents = delayed_extents.size();
+    SUBTRACET(seastore_t, "process {} delayed extents", tref, num_extents);
+    std::vector<paddr_t> delayed_paddrs;
+    delayed_paddrs.reserve(num_extents);
+    for (auto& ext : delayed_extents) {
+      assert(ext->get_paddr().is_delayed());
+      delayed_paddrs.push_back(ext->get_paddr());
+    }
+    return seastar::do_with(
+      std::move(delayed_extents),
+      std::move(delayed_paddrs),
+      [this, FNAME, &tref](auto& delayed_extents, auto& delayed_paddrs)
+    {
+      return epm->delayed_alloc_or_ool_write(tref, delayed_extents
+      ).si_then([this, FNAME, &tref, &delayed_extents, &delayed_paddrs] {
+        SUBTRACET(seastore_t, "update delayed extent mappings", tref);
+        return lba_manager->update_mappings(tref, delayed_extents, delayed_paddrs);
+      }).handle_error_interruptible(
+        crimson::ct_error::input_output_error::pass_further(),
+        crimson::ct_error::assert_all("invalid error")
+      );
+    });
   }).si_then([this, FNAME, &tref] {
     SUBTRACET(seastore_t, "about to prepare", tref);
     return tref.get_handle().enter(write_pipeline.prepare);
@@ -381,7 +398,7 @@ TransactionManager::rewrite_logical_extent(
 
   auto lextent = extent->cast<LogicalCachedExtent>();
   cache->retire_extent(t, extent);
-  auto nlextent = epm->alloc_new_extent_by_type(
+  auto nlextent = cache->alloc_new_extent_by_type(
     t,
     lextent->get_type(),
     lextent->get_length(),

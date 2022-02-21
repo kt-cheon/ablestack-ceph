@@ -6489,12 +6489,22 @@ int main(int argc, const char **argv)
         return -EINVAL;
       }
 
-      if (perm_policy_doc.empty()) {
+      if (perm_policy_doc.empty() && infile.empty()) {
         cerr << "permission policy document is empty" << std::endl;
         return -EINVAL;
       }
 
-      bufferlist bl = bufferlist::static_from_string(perm_policy_doc);
+      bufferlist bl;
+      if (!infile.empty()) {
+        int ret = read_input(infile, bl);
+        if (ret < 0) {
+          cerr << "ERROR: failed to read input policy document: " << cpp_strerror(-ret) << std::endl;
+          return -ret;
+        }
+        perm_policy_doc = bl.to_str();
+      } else {
+        bl = bufferlist::static_from_string(perm_policy_doc);
+      }
       try {
         const rgw::IAM::Policy p(g_ceph_context, tenant, bl);
       } catch (rgw::IAM::PolicyParseException& e) {
@@ -7563,7 +7573,6 @@ next:
   }
 
   if (opt_cmd == OPT::RESHARD_LIST) {
-    list<cls_rgw_reshard_entry> entries;
     int ret;
     int count = 0;
     if (max_entries < 0) {
@@ -7578,19 +7587,20 @@ next:
     formatter->open_array_section("reshard");
     for (int i = 0; i < num_logshards; i++) {
       bool is_truncated = true;
-      string marker;
+      std::string marker;
       do {
-        entries.clear();
+	std::list<cls_rgw_reshard_entry> entries;
         ret = reshard.list(dpp(), i, marker, max_entries - count, entries, &is_truncated);
         if (ret < 0) {
           cerr << "Error listing resharding buckets: " << cpp_strerror(-ret) << std::endl;
           return ret;
         }
-        for (auto iter=entries.begin(); iter != entries.end(); ++iter) {
-          cls_rgw_reshard_entry& entry = *iter;
+        for (const auto& entry : entries) {
           encode_json("entry", entry, formatter.get());
-          entry.get_key(&marker);
         }
+	if (is_truncated) {
+	  entries.crbegin()->get_key(&marker); // last entry's key becomes marker
+	}
         count += entries.size();
         formatter->flush(cout);
       } while (is_truncated && count < max_entries);
@@ -7602,6 +7612,7 @@ next:
 
     formatter->close_section();
     formatter->flush(cout);
+
     return 0;
   }
 
@@ -7658,6 +7669,8 @@ next:
       }
     }
 
+    bool resharding_underway = true;
+
     if (bucket_initable) {
       // we did not encounter an error, so let's work with the bucket
       RGWBucketReshard br(static_cast<rgw::sal::RadosStore*>(store), bucket->get_info(), bucket->get_attrs(),
@@ -7666,14 +7679,17 @@ next:
       if (ret < 0) {
         if (ret == -EBUSY) {
           cerr << "There is ongoing resharding, please retry after " <<
-            store->ctx()->_conf.get_val<uint64_t>(
-              "rgw_reshard_bucket_lock_duration") <<
-            " seconds " << std::endl;
+            store->ctx()->_conf.get_val<uint64_t>("rgw_reshard_bucket_lock_duration") <<
+            " seconds." << std::endl;
+	  return -ret;
+	} else if (ret == -EINVAL) {
+	  resharding_underway = false;
+	  // we can continue and try to unschedule
         } else {
-          cerr << "Error canceling bucket " << bucket_name <<
-            " resharding: " << cpp_strerror(-ret) << std::endl;
+          cerr << "Error cancelling bucket \"" << bucket_name <<
+            "\" resharding: " << cpp_strerror(-ret) << std::endl;
+	  return -ret;
         }
-        return ret;
       }
     }
 
@@ -7682,13 +7698,22 @@ next:
     cls_rgw_reshard_entry entry;
     entry.tenant = tenant;
     entry.bucket_name = bucket_name;
-    //entry.bucket_id = bucket_id;
 
     ret = reshard.remove(dpp(), entry);
-    if (ret < 0 && ret != -ENOENT) {
-      cerr << "Error in updating reshard log with bucket " <<
-        bucket_name << ": " << cpp_strerror(-ret) << std::endl;
-      return ret;
+    if (ret == -ENOENT) {
+      if (!resharding_underway) {
+	cerr << "Error, bucket \"" << bucket_name <<
+	  "\" is neither undergoing resharding nor scheduled to undergo "
+	  "resharding." << std::endl;
+	return EINVAL;
+      } else {
+	// we cancelled underway resharding above, so we're good
+	return 0;
+      }
+    } else if (ret < 0) {
+      cerr << "Error in updating reshard log with bucket \"" <<
+        bucket_name << "\": " << cpp_strerror(-ret) << std::endl;
+      return -ret;
     }
   } // OPT_RESHARD_CANCEL
 

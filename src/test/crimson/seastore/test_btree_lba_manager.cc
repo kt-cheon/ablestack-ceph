@@ -30,6 +30,7 @@ struct btree_test_base :
   segment_manager::EphemeralSegmentManagerRef segment_manager;
   ExtentReaderRef scanner;
   JournalRef journal;
+  ExtentPlacementManagerRef epm;
   CacheRef cache;
 
   size_t block_size;
@@ -42,7 +43,7 @@ struct btree_test_base :
 
   void update_segment_avail_bytes(paddr_t offset) final {}
 
-  get_segment_ret get_segment(device_id_t id) final {
+  get_segment_ret get_segment(device_id_t id, segment_seq_t seq) final {
     auto ret = next;
     next = segment_id_t{
       next.device_id(),
@@ -73,13 +74,15 @@ struct btree_test_base :
   seastar::future<> set_up_fut() final {
     segment_manager = segment_manager::create_test_ephemeral();
     scanner.reset(new ExtentReader());
-    journal.reset(new Journal(*segment_manager, *scanner));
-    cache.reset(new Cache(*scanner));
+    auto& scanner_ref = *scanner.get();
+    journal = journal::make_segmented(
+      *segment_manager, scanner_ref, *this);
+    epm.reset(new ExtentPlacementManager());
+    cache.reset(new Cache(scanner_ref, *epm));
 
     block_size = segment_manager->get_block_size();
     next = segment_id_t{segment_manager->get_device_id(), 0};
-    scanner->add_segment_manager(segment_manager.get());
-    journal->set_segment_provider(this);
+    scanner_ref.add_segment_manager(segment_manager.get());
     journal->set_write_pipeline(&pipeline);
 
     return segment_manager->init(
@@ -117,6 +120,7 @@ struct btree_test_base :
       segment_manager.reset();
       scanner.reset();
       journal.reset();
+      epm.reset();
       cache.reset();
     }).handle_error(
       crimson::ct_error::all_same_way([] {
