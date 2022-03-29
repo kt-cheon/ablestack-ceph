@@ -100,7 +100,36 @@ class CachedExtent : public boost::intrusive_ref_counter<
   // Points at current version while in state MUTATION_PENDING
   CachedExtentRef prior_instance;
 
+  // time of the last modification
+  seastar::lowres_system_clock::time_point last_modified;
+
+  // time of the last rewrite
+  seastar::lowres_system_clock::time_point last_rewritten;
 public:
+
+  void set_last_modified(seastar::lowres_system_clock::duration d) {
+    last_modified = seastar::lowres_system_clock::time_point(d);
+  }
+
+  void set_last_modified(seastar::lowres_system_clock::time_point t) {
+    last_modified = t;
+  }
+
+  seastar::lowres_system_clock::time_point get_last_modified() const {
+    return last_modified;
+  }
+
+  void set_last_rewritten(seastar::lowres_system_clock::duration d) {
+    last_rewritten = seastar::lowres_system_clock::time_point(d);
+  }
+
+  void set_last_rewritten(seastar::lowres_system_clock::time_point t) {
+    last_rewritten = t;
+  }
+
+  seastar::lowres_system_clock::time_point get_last_rewritten() const {
+    return last_rewritten;
+  }
   /**
    *  duplicate_for_write
    *
@@ -170,6 +199,8 @@ public:
 	<< ", type=" << get_type()
 	<< ", version=" << version
 	<< ", dirty_from_or_retired_at=" << dirty_from_or_retired_at
+	<< ", last_modified=" << last_modified.time_since_epoch()
+	<< ", last_rewritten=" << last_rewritten.time_since_epoch()
 	<< ", paddr=" << get_paddr()
 	<< ", length=" << get_length()
 	<< ", state=" << state
@@ -388,7 +419,7 @@ private:
   ceph::bufferptr ptr;
 
   /// number of deltas since initial write
-  extent_version_t version = EXTENT_VERSION_NULL;
+  extent_version_t version = 0;
 
   /// address of original block -- relative iff is_pending() and is_clean()
   paddr_t poffset;
@@ -635,20 +666,30 @@ private:
 };
 
 class LogicalCachedExtent;
-class LBAPin;
-using LBAPinRef = std::unique_ptr<LBAPin>;
-class LBAPin {
+
+template <typename key_t>
+class PhysicalNodePin;
+
+template <typename key_t>
+using PhysicalNodePinRef = std::unique_ptr<PhysicalNodePin<key_t>>;
+
+template <typename key_t>
+class PhysicalNodePin {
 public:
   virtual void link_extent(LogicalCachedExtent *ref) = 0;
-  virtual void take_pin(LBAPin &pin) = 0;
+  virtual void take_pin(PhysicalNodePin<key_t> &pin) = 0;
   virtual extent_len_t get_length() const = 0;
   virtual paddr_t get_paddr() const = 0;
-  virtual laddr_t get_laddr() const = 0;
-  virtual LBAPinRef duplicate() const = 0;
+  virtual key_t get_key() const = 0;
+  virtual PhysicalNodePinRef<key_t> duplicate() const = 0;
   virtual bool has_been_invalidated() const = 0;
 
-  virtual ~LBAPin() {}
+  virtual ~PhysicalNodePin() {}
 };
+
+using LBAPin = PhysicalNodePin<laddr_t>;
+using LBAPinRef = PhysicalNodePinRef<laddr_t>;
+
 std::ostream &operator<<(std::ostream &out, const LBAPin &rhs);
 
 using lba_pin_list_t = std::list<LBAPinRef>;
@@ -725,7 +766,7 @@ public:
   void set_pin(LBAPinRef &&npin) {
     assert(!pin);
     pin = std::move(npin);
-    laddr = pin->get_laddr();
+    laddr = pin->get_key();
     pin->link_extent(this);
   }
 

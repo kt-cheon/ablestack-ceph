@@ -34,6 +34,16 @@ public:
     segment_header_t>;
   read_segment_header_ret read_segment_header(segment_id_t segment);
 
+  using read_segment_tail_ertr = read_segment_header_ertr;
+  using read_segment_tail_ret = read_segment_tail_ertr::future<
+    segment_tail_t>;
+  read_segment_tail_ret  read_segment_tail(segment_id_t segment);
+
+  struct commit_info_t {
+    mod_time_point_t commit_time;
+    record_commit_type_t commit_type;
+  };
+
   /**
    * scan_extents
    *
@@ -45,7 +55,8 @@ public:
    */
   using scan_extents_cursor = scan_valid_records_cursor;
   using scan_extents_ertr = read_ertr::extend<crimson::ct_error::enodata>;
-  using scan_extents_ret_bare = std::list<std::pair<paddr_t, extent_info_t>>;
+  using scan_extents_ret_bare =
+    std::list<std::pair<paddr_t, std::pair<commit_info_t, extent_info_t>>>;
   using scan_extents_ret = scan_extents_ertr::future<scan_extents_ret_bare>;
   scan_extents_ret scan_extents(
     scan_extents_cursor &cursor,
@@ -70,8 +81,7 @@ public:
   ); ///< @return used budget
 
   void add_segment_manager(SegmentManager* segment_manager) {
-    assert(!segment_managers[segment_manager->get_device_id()] ||
-      segment_manager == segment_managers[segment_manager->get_device_id()]);
+    ceph_assert(!segment_managers[segment_manager->get_device_id()]);
     segment_managers[segment_manager->get_device_id()] = segment_manager;
   }
 
@@ -81,6 +91,11 @@ public:
     ceph::bufferptr &out) {
     assert(segment_managers[addr.get_device_id()]);
     return segment_managers[addr.get_device_id()]->read(addr, len, out);
+  }
+
+  void reset() {
+    segment_managers.clear();
+    segment_managers.resize(DEVICE_ID_MAX, nullptr);
   }
 
 private:

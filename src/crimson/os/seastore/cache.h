@@ -501,6 +501,7 @@ public:
     auto result = epm.alloc_new_extent(t, T::TYPE, length, hint);
     auto ret = CachedExtent::make_cached_extent_ref<T>(std::move(result.bp));
     ret->set_paddr(result.paddr);
+    ret->hint = hint;
     t.add_fresh_extent(ret);
     ret->state = CachedExtent::extent_state_t::INITIAL_WRITE_PENDING;
     SUBDEBUGT(seastore_cache, "allocated {} {}B extent at {}, hint={} -- {}",
@@ -596,7 +597,8 @@ public:
   replay_delta_ret replay_delta(
     journal_seq_t seq,
     paddr_t record_block_base,
-    const delta_info_t &delta);
+    const delta_info_t &delta,
+    seastar::lowres_system_clock::time_point& last_modified);
 
   /**
    * init_cached_extents
@@ -619,7 +621,7 @@ public:
         extents.size(),
         extents.get_bytes(),
         dirty.size(),
-        get_oldest_dirty_from().value_or(journal_seq_t{}));
+        get_oldest_dirty_from().value_or(JOURNAL_SEQ_NULL));
 
     // journal replay should has been finished at this point,
     // Cache::root should have been inserted to the dirty list
@@ -660,7 +662,7 @@ public:
           extents.size(),
           extents.get_bytes(),
           dirty.size(),
-          get_oldest_dirty_from().value_or(journal_seq_t{}));
+          get_oldest_dirty_from().value_or(JOURNAL_SEQ_NULL));
     });
   }
 
@@ -724,7 +726,7 @@ public:
       return std::nullopt;
     } else {
       auto oldest = dirty.begin()->get_dirty_from();
-      if (oldest == journal_seq_t()) {
+      if (oldest == JOURNAL_SEQ_NULL) {
 	return std::nullopt;
       } else {
 	return oldest;
@@ -871,7 +873,6 @@ private:
     counter_by_extent_t<io_stat_t> fresh_ool_by_ext;
     uint64_t num_trans = 0; // the number of inline records
     uint64_t num_ool_records = 0;
-    uint64_t ool_record_padding_bytes = 0;
     uint64_t ool_record_metadata_bytes = 0;
     uint64_t ool_record_data_bytes = 0;
     uint64_t inline_record_metadata_bytes = 0; // metadata exclude the delta bytes

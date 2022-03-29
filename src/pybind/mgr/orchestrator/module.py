@@ -7,11 +7,11 @@ import datetime
 
 import yaml
 from prettytable import PrettyTable
+from natsort import natsorted
 
 from ceph.deployment.inventory import Device
 from ceph.deployment.drive_group import DriveGroupSpec, DeviceSelection, OSDMethod
-from ceph.deployment.service_spec import PlacementSpec, ServiceSpec, service_spec_allow_invalid_from_json, \
-    SNMPGatewaySpec
+from ceph.deployment.service_spec import PlacementSpec, ServiceSpec, service_spec_allow_invalid_from_json
 from ceph.deployment.hostspec import SpecValidationError
 from ceph.utils import datetime_now
 
@@ -23,7 +23,7 @@ from ._interface import OrchestratorClientMixin, DeviceLightLoc, _cli_read_comma
     NoOrchestrator, OrchestratorValidationError, NFSServiceSpec, \
     RGWSpec, InventoryFilter, InventoryHost, HostSpec, CLICommandMeta, \
     ServiceDescription, DaemonDescription, IscsiServiceSpec, json_to_generic_spec, \
-    GenericSpec, DaemonDescriptionStatus
+    GenericSpec, DaemonDescriptionStatus, SNMPGatewaySpec, MDSSpec
 
 
 def nice_delta(now: datetime.datetime, t: Optional[datetime.datetime], suffix: str = '') -> str:
@@ -44,6 +44,8 @@ class Format(enum.Enum):
     json = 'json'
     json_pretty = 'json-pretty'
     yaml = 'yaml'
+    xml_pretty = 'xml-pretty'
+    xml = 'xml'
 
 
 class ServiceType(enum.Enum):
@@ -56,6 +58,8 @@ class ServiceType(enum.Enum):
     grafana = 'grafana'
     node_exporter = 'node-exporter'
     prometheus = 'prometheus'
+    loki = 'loki'
+    promtail = 'promtail'
     mds = 'mds'
     rgw = 'rgw'
     nfs = 'nfs'
@@ -115,6 +119,8 @@ def to_format(what: Any, format: Format, many: bool, cls: Any) -> Any:
         if many:
             return yaml.dump_all(to_yaml(copy), default_flow_style=False)
         return yaml.dump(to_yaml(copy), default_flow_style=False)
+    elif format == Format.xml or format == Format.xml_pretty:
+        raise OrchestratorError(f"format '{format.name}' is not implemented.")
     else:
         raise OrchestratorError(f'unsupported format type: {format}')
 
@@ -357,9 +363,9 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
         return HandleCommandResult(stdout=completion.result_str())
 
     @_cli_write_command('orch host drain')
-    def _drain_host(self, hostname: str) -> HandleCommandResult:
+    def _drain_host(self, hostname: str, force: bool = False) -> HandleCommandResult:
         """drain all daemons from a host"""
-        completion = self.drain_host(hostname)
+        completion = self.drain_host(hostname, force)
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 
@@ -395,7 +401,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
             table.align = 'l'
             table.left_padding_width = 0
             table.right_padding_width = 2
-            for host in sorted(hosts, key=lambda h: h.hostname):
+            for host in natsorted(hosts, key=lambda h: h.hostname):
                 table.add_row((host.hostname, host.addr, ' '.join(
                     host.labels), host.status.capitalize()))
             output = table.get_string()
@@ -417,9 +423,9 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
         return HandleCommandResult(stdout=completion.result_str())
 
     @_cli_write_command('orch host label rm')
-    def _host_label_rm(self, hostname: str, label: str) -> HandleCommandResult:
+    def _host_label_rm(self, hostname: str, label: str, force: bool = False) -> HandleCommandResult:
         """Remove a host label"""
-        completion = self.remove_host_label(hostname, label)
+        completion = self.remove_host_label(hostname, label, force)
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 
@@ -430,8 +436,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 
-    @_cli_write_command(
-        'orch host maintenance enter')
+    @_cli_write_command('orch host maintenance enter')
     def _host_maintenance_enter(self, hostname: str, force: bool = False) -> HandleCommandResult:
         """
         Prepare a host for maintenance by shutting down and disabling all Ceph daemons (cephadm only)
@@ -441,8 +446,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
 
         return HandleCommandResult(stdout=completion.result_str())
 
-    @_cli_write_command(
-        'orch host maintenance exit')
+    @_cli_write_command('orch host maintenance exit')
     def _host_maintenance_exit(self, hostname: str) -> HandleCommandResult:
         """
         Return a host from maintenance, restarting all Ceph daemons (cephadm only)
@@ -492,18 +496,19 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
                 table = PrettyTable(
                     ['HOST', 'PATH', 'TYPE', 'TRANSPORT', 'RPM', 'DEVICE ID', 'SIZE',
                      'HEALTH', 'IDENT', 'FAULT',
-                     'AVAILABLE', 'REJECT REASONS'],
+                     'AVAILABLE', 'REFRESHED', 'REJECT REASONS'],
                     border=False)
             else:
                 table = PrettyTable(
                     ['HOST', 'PATH', 'TYPE', 'DEVICE ID', 'SIZE',
-                     'AVAILABLE', 'REJECT REASONS'],
+                     'AVAILABLE', 'REFRESHED', 'REJECT REASONS'],
                     border=False)
             table.align = 'l'
             table._align['SIZE'] = 'r'
             table.left_padding_width = 0
             table.right_padding_width = 2
-            for host_ in sorted(inv_hosts, key=lambda h: h.name):  # type: InventoryHost
+            now = datetime_now()
+            for host_ in natsorted(inv_hosts, key=lambda h: h.name):  # type: InventoryHost
                 for d in sorted(host_.devices.devices, key=lambda d: d.path):  # type: Device
 
                     led_ident = 'N/A'
@@ -526,6 +531,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
                                 display_map[led_ident],
                                 display_map[led_fail],
                                 display_map[d.available],
+                                nice_delta(now, d.created, ' ago'),
                                 ', '.join(d.rejected_reasons)
                             )
                         )
@@ -538,6 +544,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
                                 d.device_id,
                                 format_dimless(d.sys_api.get('size', 0), 5),
                                 display_map[d.available],
+                                nice_delta(now, d.created, ' ago'),
                                 ', '.join(d.rejected_reasons)
                             )
                         )
@@ -679,7 +686,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
             table._align['MEM LIM'] = 'r'
             table.left_padding_width = 0
             table.right_padding_width = 2
-            for s in sorted(daemons, key=lambda s: s.name()):
+            for s in natsorted(daemons, key=lambda d: d.name()):
                 if s.status_desc:
                     status = s.status_desc
                 else:
@@ -1068,12 +1075,15 @@ Usage:
         if inbuf:
             raise OrchestratorValidationError('unrecognized command -i; -h or --help for usage')
 
-        spec = ServiceSpec(
+        spec = MDSSpec(
             service_type='mds',
             service_id=fs_name,
             placement=PlacementSpec.from_string(placement),
             unmanaged=unmanaged,
             preview_only=dry_run)
+
+        spec.validate()  # force any validation exceptions to be caught correctly
+
         return self._apply_misc([spec], dry_run, format, no_overwrite)
 
     @_cli_write_command('orch apply rgw')
@@ -1112,6 +1122,8 @@ Usage:
             preview_only=dry_run
         )
 
+        spec.validate()  # force any validation exceptions to be caught correctly
+
         return self._apply_misc([spec], dry_run, format, no_overwrite)
 
     @_cli_write_command('orch apply nfs')
@@ -1135,6 +1147,8 @@ Usage:
             unmanaged=unmanaged,
             preview_only=dry_run
         )
+
+        spec.validate()  # force any validation exceptions to be caught correctly
 
         return self._apply_misc([spec], dry_run, format, no_overwrite)
 
@@ -1164,6 +1178,8 @@ Usage:
             unmanaged=unmanaged,
             preview_only=dry_run
         )
+
+        spec.validate()  # force any validation exceptions to be caught correctly
 
         return self._apply_misc([spec], dry_run, format, no_overwrite)
 

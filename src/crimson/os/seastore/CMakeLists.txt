@@ -11,8 +11,6 @@ set(crimson_seastore_srcs
   lba_manager.cc
   segment_cleaner.cc
   lba_manager/btree/btree_lba_manager.cc
-  lba_manager/btree/btree_range_pin.cc
-  lba_manager/btree/lba_btree.cc
   lba_manager/btree/lba_btree_node.cc
   omap_manager.cc
   omap_manager/btree/btree_omap_manager.cc
@@ -39,6 +37,7 @@ set(crimson_seastore_srcs
   random_block_manager/nvme_manager.cc
   random_block_manager/nvmedevice.cc
   journal/segmented_journal.cc
+  journal/segment_allocator.cc
   journal.cc
   ../../../test/crimson/seastore/test_block.cc
   ${PROJECT_SOURCE_DIR}/src/os/Transaction.cc

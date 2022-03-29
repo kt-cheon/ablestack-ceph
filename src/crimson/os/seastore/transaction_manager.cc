@@ -51,8 +51,10 @@ TransactionManager::mkfs_ertr::future<> TransactionManager::mkfs()
     scanner.get_segment_managers()
   ).safe_then([this] {
     return journal->open_for_write();
-  }).safe_then([this, FNAME](auto addr) {
+  }).safe_then([this](auto addr) {
     segment_cleaner->init_mkfs(addr);
+    return epm->open();
+  }).safe_then([this, FNAME]() {
     return with_transaction_intr(
       Transaction::src_t::MUTATE,
       "mkfs_tm",
@@ -90,14 +92,15 @@ TransactionManager::mount_ertr::future<> TransactionManager::mount()
     scanner.get_segment_managers()
   ).safe_then([this] {
     return journal->replay(
-      [this](const auto &offsets, const auto &e) {
+      [this](const auto &offsets, const auto &e, auto last_modified) {
 	auto start_seq = offsets.write_result.start_seq;
 	segment_cleaner->update_journal_tail_target(
 	  cache->get_oldest_dirty_from().value_or(start_seq));
 	return cache->replay_delta(
 	  start_seq,
 	  offsets.record_block_base,
-	  e);
+	  e,
+	  last_modified);
       });
   }).safe_then([this] {
     return journal->open_for_write();
@@ -127,13 +130,17 @@ TransactionManager::mount_ertr::future<> TransactionManager::mount()
 		    segment_cleaner->mark_space_used(
 		      addr,
 		      len ,
+		      seastar::lowres_system_clock::time_point(),
+		      seastar::lowres_system_clock::time_point(),
 		      /* init_scan = */ true);
 		  }
 		});
 	    });
 	  });
       });
-  }).safe_then([this, FNAME] {
+  }).safe_then([this] {
+    return epm->open();
+  }).safe_then([FNAME, this] {
     segment_cleaner->complete_init();
     INFO("completed");
   }).handle_error(
@@ -153,6 +160,9 @@ TransactionManager::close_ertr::future<> TransactionManager::close() {
   }).safe_then([this] {
     cache->dump_contents();
     return journal->close();
+  }).safe_then([this] {
+    scanner.reset();
+    return epm->close();
   }).safe_then([FNAME] {
     INFO("completed");
     return seastar::now();
@@ -409,6 +419,7 @@ TransactionManager::rewrite_logical_extent(
     nlextent->get_bptr().c_str());
   nlextent->set_laddr(lextent->get_laddr());
   nlextent->set_pin(lextent->get_pin().duplicate());
+  nlextent->last_modified = lextent->last_modified;
 
   DEBUGT("rewriting extent -- {} to {}", t, *lextent, *nlextent);
 
@@ -477,14 +488,14 @@ TransactionManager::get_extent_if_live_ret TransactionManager::get_extent_if_liv
       return lba_manager->get_mapping(
 	t,
 	laddr).si_then([=, &t] (LBAPinRef pin) -> inner_ret {
-	  ceph_assert(pin->get_laddr() == laddr);
+	  ceph_assert(pin->get_key() == laddr);
 	  if (pin->get_paddr() == addr) {
 	    if (pin->get_length() != (extent_len_t)len) {
 	      ERRORT(
 		"Invalid pin {}~{} {} found for "
 		"extent {} {}~{} {}",
 		t,
-		pin->get_laddr(),
+		pin->get_key(),
 		pin->get_length(),
 		pin->get_paddr(),
 		type,
@@ -543,5 +554,30 @@ TransactionManager::get_extent_if_live_ret TransactionManager::get_extent_if_liv
 }
 
 TransactionManager::~TransactionManager() {}
+
+TransactionManagerRef make_transaction_manager(
+    SegmentManager& sm,
+    bool detailed)
+{
+  auto scanner = std::make_unique<ExtentReader>();
+  auto& scanner_ref = *scanner.get();
+  auto segment_cleaner = std::make_unique<SegmentCleaner>(
+    SegmentCleaner::config_t::get_default(),
+    std::move(scanner),
+    detailed);
+  auto journal = journal::make_segmented(sm, scanner_ref, *segment_cleaner);
+  auto epm = std::make_unique<ExtentPlacementManager>();
+  auto cache = std::make_unique<Cache>(scanner_ref, *epm);
+  auto lba_manager = lba_manager::create_lba_manager(sm, *cache);
+
+  return std::make_unique<TransactionManager>(
+    sm,
+    std::move(segment_cleaner),
+    std::move(journal),
+    std::move(cache),
+    std::move(lba_manager),
+    std::move(epm),
+    scanner_ref);
+}
 
 }

@@ -1573,8 +1573,7 @@ int set_user_quota(OPT opt_cmd, RGWUser& user, RGWUserAdminOpState& op_state, in
 
 int check_min_obj_stripe_size(rgw::sal::Store* store, rgw::sal::Object* obj, uint64_t min_stripe_size, bool *need_rewrite)
 {
-  RGWObjectCtx obj_ctx(store);
-  int ret = obj->get_obj_attrs(&obj_ctx, null_yield, dpp());
+  int ret = obj->get_obj_attrs(null_yield, dpp());
   if (ret < 0) {
     ldpp_dout(dpp(), -1) << "ERROR: failed to stat object, returned error: " << cpp_strerror(-ret) << dendl;
     return ret;
@@ -1630,8 +1629,7 @@ int check_obj_locator_underscore(rgw::sal::Object* obj, bool fix, bool remove_ba
   f->dump_string("oid", oid);
   f->dump_string("locator", locator);
 
-  RGWObjectCtx obj_ctx(store);
-  std::unique_ptr<rgw::sal::Object::ReadOp> read_op = obj->get_read_op(&obj_ctx);
+  std::unique_ptr<rgw::sal::Object::ReadOp> read_op = obj->get_read_op();
 
   int ret = read_op->prepare(null_yield, dpp());
   bool needs_fixing = (ret == -ENOENT);
@@ -4239,7 +4237,9 @@ int main(int argc, const char **argv)
 			 OPT::USER_RM,    // --purge-data
 			 OPT::OBJECTS_EXPIRE,
 			 OPT::OBJECTS_EXPIRE_STALE_RM,
-			 OPT::LC_PROCESS
+			 OPT::LC_PROCESS,
+       OPT::BUCKET_SYNC_RUN,
+       OPT::DATA_SYNC_RUN
     };
 
     raw_storage_op = (raw_storage_ops_list.find(opt_cmd) != raw_storage_ops_list.end() ||
@@ -6805,7 +6805,6 @@ int main(int argc, const char **argv)
     bucket_op.set_bucket_name(bucket_name);
     bucket_op.set_new_bucket_name(new_bucket_name);
     string err;
-    string marker;
 
     int r = RGWBucketAdminOp::chown(store, bucket_op, marker, dpp(), &err);
     if (r < 0) {
@@ -7120,12 +7119,11 @@ next:
     map<uint64_t, vector<rgw_bucket_olh_log_entry> > log;
     bool is_truncated;
 
-    RGWObjectCtx rctx(store);
     std::unique_ptr<rgw::sal::Object> obj = bucket->get_object(object);
 
     RGWObjState *state;
 
-    ret = obj->get_obj_state(dpp(), &rctx, &state, null_yield);
+    ret = obj->get_obj_state(dpp(), &state, null_yield);
     if (ret < 0) {
       return -ret;
     }
@@ -7744,9 +7742,7 @@ next:
     std::unique_ptr<rgw::sal::Object> obj = bucket->get_object(object);
     obj->set_instance(object_version);
 
-    RGWObjectCtx obj_ctx(store);
-
-    ret = obj->get_obj_attrs(&obj_ctx, null_yield, dpp());
+    ret = obj->get_obj_attrs(null_yield, dpp());
     if (ret < 0) {
       cerr << "ERROR: failed to stat object, returned error: " << cpp_strerror(-ret) << std::endl;
       return 1;
@@ -7877,6 +7873,7 @@ next:
       for (const auto& entry : bucket_lc_map) {
         formatter->open_object_section("bucket_lc_info");
         formatter->dump_string("bucket", entry.bucket);
+	formatter->dump_string("shard", entry.oid);
 	char exp_buf[100];
 	time_t t{time_t(entry.start_time)};
 	if (std::strftime(
@@ -9137,11 +9134,15 @@ next:
       }
     }
 
-    pipe->source.add_zones(*opt_source_zone_ids);
+    if (opt_source_zone_ids) {
+      pipe->source.add_zones(*opt_source_zone_ids);
+    }
     pipe->source.set_bucket(opt_source_tenant,
                             opt_source_bucket_name,
                             opt_source_bucket_id);
-    pipe->dest.add_zones(*opt_dest_zone_ids);
+    if (opt_dest_zone_ids) {
+      pipe->dest.add_zones(*opt_dest_zone_ids);
+    }
     pipe->dest.set_bucket(opt_dest_tenant,
                             opt_dest_bucket_name,
                             opt_dest_bucket_id);

@@ -52,7 +52,7 @@ from .services.iscsi import IscsiService
 from .services.nfs import NFSService
 from .services.osd import OSDRemovalQueue, OSDService, OSD, NotFoundError
 from .services.monitoring import GrafanaService, AlertmanagerService, PrometheusService, \
-    NodeExporterService, SNMPGatewayService
+    NodeExporterService, SNMPGatewayService, LokiService, PromtailService
 from .schedule import HostAssignment
 from .inventory import Inventory, SpecStore, HostCache, AgentCache, EventStore, \
     ClientKeyringStore, ClientKeyringSpec
@@ -93,6 +93,8 @@ os._exit = os_exit_noop   # type: ignore
 DEFAULT_IMAGE = 'quay.io/ceph/ceph'
 DEFAULT_PROMETHEUS_IMAGE = 'quay.io/prometheus/prometheus:v2.18.1'
 DEFAULT_NODE_EXPORTER_IMAGE = 'quay.io/prometheus/node-exporter:v0.18.1'
+DEFAULT_LOKI_IMAGE = 'docker.io/grafana/loki:2.4.0'
+DEFAULT_PROMTAIL_IMAGE = 'docker.io/grafana/promtail:2.4.0'
 DEFAULT_ALERT_MANAGER_IMAGE = 'quay.io/prometheus/alertmanager:v0.20.0'
 DEFAULT_GRAFANA_IMAGE = 'quay.io/ceph/ceph-grafana:6.7.4'
 DEFAULT_HAPROXY_IMAGE = 'docker.io/library/haproxy:2.3'
@@ -196,6 +198,16 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             'container_image_node_exporter',
             default=DEFAULT_NODE_EXPORTER_IMAGE,
             desc='Prometheus container image',
+        ),
+        Option(
+            'container_image_loki',
+            default=DEFAULT_LOKI_IMAGE,
+            desc='Loki container image',
+        ),
+        Option(
+            'container_image_promtail',
+            default=DEFAULT_PROMTAIL_IMAGE,
+            desc='Promtail container image',
         ),
         Option(
             'container_image_haproxy',
@@ -410,6 +422,8 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             self.container_image_grafana = ''
             self.container_image_alertmanager = ''
             self.container_image_node_exporter = ''
+            self.container_image_loki = ''
+            self.container_image_promtail = ''
             self.container_image_haproxy = ''
             self.container_image_keepalived = ''
             self.container_image_snmp_gateway = ''
@@ -505,7 +519,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
         _service_clses: Sequence[Type[CephadmService]] = [
             OSDService, NFSService, MonService, MgrService, MdsService,
             RgwService, RbdMirrorService, GrafanaService, AlertmanagerService,
-            PrometheusService, NodeExporterService, CrashService, IscsiService,
+            PrometheusService, NodeExporterService, LokiService, PromtailService, CrashService, IscsiService,
             IngressService, CustomContainerService, CephfsMirrorService,
             CephadmAgent, SNMPGatewayService
         ]
@@ -657,7 +671,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
         suffix = daemon_type not in [
             'mon', 'crash',
             'prometheus', 'node-exporter', 'grafana', 'alertmanager',
-            'container', 'agent', 'snmp-gateway'
+            'container', 'agent', 'snmp-gateway', 'loki', 'promtail'
         ]
         if forcename:
             if len([d for d in existing if d.daemon_id == forcename]):
@@ -1293,6 +1307,10 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
             image = self.container_image_alertmanager
         elif daemon_type == 'node-exporter':
             image = self.container_image_node_exporter
+        elif daemon_type == 'loki':
+            image = self.container_image_loki
+        elif daemon_type == 'promtail':
+            image = self.container_image_promtail
         elif daemon_type == 'haproxy':
             image = self.container_image_haproxy
         elif daemon_type == 'keepalived':
@@ -1520,7 +1538,19 @@ Then run the following:
         return 'Added label %s to host %s' % (label, host)
 
     @handle_orch_error
-    def remove_host_label(self, host: str, label: str) -> str:
+    def remove_host_label(self, host: str, label: str, force: bool = False) -> str:
+        # if we remove the _admin label from the only host that has it we could end up
+        # removing the only instance of the config and keyring and cause issues
+        if not force and label == '_admin':
+            p = PlacementSpec(label='_admin')
+            admin_hosts = p.filter_matching_hostspecs(self.inventory.all_specs())
+            if len(admin_hosts) == 1 and admin_hosts[0] == host:
+                raise OrchestratorValidationError(f"Host {host} is the last host with the '_admin'"
+                                                  " label.\nRemoving the _admin label from this host could cause the removal"
+                                                  " of the last cluster config/keyring managed by cephadm.\n"
+                                                  "It is recommended to add the _admin label to another host"
+                                                  " before completing this operation.\nIf you're certain this is"
+                                                  " what you want rerun this command with --force.")
         self.inventory.rm_label(host, label)
         self.log.info('Removed label %s to host %s' % (label, host))
         self._kick_serve_loop()
@@ -1963,6 +1993,8 @@ Then run the following:
             if self.spec_store[service_name].spec.service_type in ('mon', 'mgr'):
                 return f'Unable to remove {service_name} service.\n' \
                        f'Note, you might want to mark the {service_name} service as "unmanaged"'
+        else:
+            return f"Invalid service '{service_name}'. Use 'ceph orch ls' to list available services.\n"
 
         # Report list of affected OSDs?
         if not force and service_name.startswith('osd.'):
@@ -2271,6 +2303,8 @@ Then run the following:
             for dep_type in need.get(daemon_type, []):
                 for dd in self.cache.get_daemons_by_type(dep_type):
                     deps.append(dd.name())
+            if daemon_type == 'prometheus':
+                deps.append(str(self.get_module_option_ex('prometheus', 'server_port', 9283)))
         return sorted(deps)
 
     @forall_hosts
@@ -2445,6 +2479,8 @@ Then run the following:
                 'alertmanager': PlacementSpec(count=1),
                 'prometheus': PlacementSpec(count=1),
                 'node-exporter': PlacementSpec(host_pattern='*'),
+                'loki': PlacementSpec(count=1),
+                'promtail': PlacementSpec(host_pattern='*'),
                 'crash': PlacementSpec(host_pattern='*'),
                 'container': PlacementSpec(count=1),
                 'snmp-gateway': PlacementSpec(count=1),
@@ -2538,6 +2574,14 @@ Then run the following:
 
     @handle_orch_error
     def apply_prometheus(self, spec: ServiceSpec) -> str:
+        return self._apply(spec)
+
+    @handle_orch_error
+    def apply_loki(self, spec: ServiceSpec) -> str:
+        return self._apply(spec)
+
+    @handle_orch_error
+    def apply_promtail(self, spec: ServiceSpec) -> str:
         return self._apply(spec)
 
     @handle_orch_error
@@ -2701,12 +2745,26 @@ Then run the following:
         return self.to_remove_osds.all_osds()
 
     @handle_orch_error
-    def drain_host(self, hostname):
-        # type: (str) -> str
+    def drain_host(self, hostname, force=False):
+        # type: (str, bool) -> str
         """
         Drain all daemons from a host.
         :param host: host name
         """
+
+        # if we drain the last admin host we could end up removing the only instance
+        # of the config and keyring and cause issues
+        if not force:
+            p = PlacementSpec(label='_admin')
+            admin_hosts = p.filter_matching_hostspecs(self.inventory.all_specs())
+            if len(admin_hosts) == 1 and admin_hosts[0] == hostname:
+                raise OrchestratorValidationError(f"Host {hostname} is the last host with the '_admin'"
+                                                  " label.\nDraining this host could cause the removal"
+                                                  " of the last cluster config/keyring managed by cephadm.\n"
+                                                  "It is recommended to add the _admin label to another host"
+                                                  " before completing this operation.\nIf you're certain this is"
+                                                  " what you want rerun this command with --force.")
+
         self.add_host_label(hostname, '_no_schedule')
 
         daemons: List[orchestrator.DaemonDescription] = self.cache.get_daemons_by_host(hostname)

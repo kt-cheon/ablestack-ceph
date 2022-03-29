@@ -128,7 +128,13 @@ public:
     const OSDOp& osd_op,
     ceph::os::Transaction& trans,
     object_stat_sum_t& delta_stats);
-  interruptible_future<> remove(
+  using remove_ertr = crimson::errorator<
+    crimson::ct_error::enoent>;
+  using remove_iertr =
+    ::crimson::interruptible::interruptible_errorator<
+      ::crimson::osd::IOInterruptCondition,
+      remove_ertr>;
+  remove_iertr::future<> remove(
     ObjectState& os,
     ceph::os::Transaction& txn,
     object_stat_sum_t& delta_stats);
@@ -205,6 +211,9 @@ public:
   get_attr_ierrorator::future<ceph::bufferlist> getxattr(
     const hobject_t& soid,
     std::string_view key) const;
+  get_attr_ierrorator::future<ceph::bufferlist> getxattr(
+    const hobject_t& soid,
+    std::string&& key) const;
   get_attr_ierrorator::future<> get_xattrs(
     const ObjectState& os,
     OSDOp& osd_op,
@@ -230,7 +239,7 @@ public:
   interruptible_future<struct stat> stat(
     CollectionRef c,
     const ghobject_t& oid) const;
-  interruptible_future<std::map<uint64_t, uint64_t>> fiemap(
+  read_errorator::future<std::map<uint64_t, uint64_t>> fiemap(
     CollectionRef c,
     const ghobject_t& oid,
     uint64_t off,

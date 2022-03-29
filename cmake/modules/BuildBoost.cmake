@@ -1,8 +1,9 @@
-# This module builds Boost
-# executables are. It sets the following variables:
+# This module builds Boost. It sets the following variables:
 #
 #  Boost_FOUND : boolean            - system has Boost
+#  BOOST_ROOT : path
 #  Boost_LIBRARIES : list(filepath) - the libraries needed to use Boost
+#  Boost_LIBRARY_DIR_RELEASE : path - the library path
 #  Boost_INCLUDE_DIRS : list(path)  - the Boost include directories
 #
 # Following hints are respected
@@ -153,14 +154,10 @@ function(do_build_boost root_dir version)
     set(boost_version 1.75.0)
     set(boost_sha256 953db31e016db7bb207f11432bef7df100516eeb746843fa0486a222e3fd49cb)
     string(REPLACE "." "_" boost_version_underscore ${boost_version} )
-    set(boost_url 
-      https://boostorg.jfrog.io/artifactory/main/release/${boost_version}/source/boost_${boost_version_underscore}.tar.bz2)
-    if(CMAKE_VERSION VERSION_GREATER 3.7)
-      set(boost_url
-        "${boost_url} http://downloads.sourceforge.net/project/boost/boost/${boost_version}/boost_${boost_version_underscore}.tar.bz2")
-      set(boost_url
-        "${boost_url} https://download.ceph.com/qa/boost_${boost_version_underscore}.tar.bz2")
-    endif()
+    string(JOIN " " boost_url
+      https://boostorg.jfrog.io/artifactory/main/release/${boost_version}/source/boost_${boost_version_underscore}.tar.bz2
+      https://downloads.sourceforge.net/project/boost/boost/${boost_version}/boost_${boost_version_underscore}.tar.bz2
+      https://download.ceph.com/qa/boost_${boost_version_underscore}.tar.bz2)
     set(source_dir
       URL ${boost_url}
       URL_HASH SHA256=${boost_sha256}
@@ -190,8 +187,10 @@ macro(build_boost version)
   # target, so we can collect "Boost_LIBRARIES" which is then used by
   # ExternalProject_Add(Boost ...)
   set(install_dir "${CMAKE_BINARY_DIR}/boost")
+  set(BOOST_ROOT ${install_dir})
   set(Boost_INCLUDE_DIRS ${install_dir}/include)
   set(Boost_INCLUDE_DIR ${install_dir}/include)
+  set(Boost_LIBRARY_DIR_RELEASE ${install_dir}/lib)
   set(Boost_VERSION ${version})
   # create the directory so cmake won't complain when looking at the imported
   # target

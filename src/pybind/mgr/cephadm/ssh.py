@@ -75,7 +75,10 @@ class SSHManager:
 
             with self.redirect_log(host, addr):
                 try:
-                    conn = await asyncssh.connect(addr, username=self.mgr.ssh_user, client_keys=[self.mgr.tkey.name], known_hosts=None, config=[self.mgr.ssh_config_fname], preferred_auth=['publickey'])
+                    ssh_options = asyncssh.SSHClientConnectionOptions(keepalive_interval=7, keepalive_count_max=3)
+                    conn = await asyncssh.connect(addr, username=self.mgr.ssh_user, client_keys=[self.mgr.tkey.name],
+                                                  known_hosts=None, config=[self.mgr.ssh_config_fname],
+                                                  preferred_auth=['publickey'], options=ssh_options)
                 except OSError:
                     raise
                 except asyncssh.Error:
@@ -92,7 +95,7 @@ class SSHManager:
     def redirect_log(self, host: str, addr: str) -> Iterator[None]:
         log_string = StringIO()
         ch = logging.StreamHandler(log_string)
-        ch.setLevel(logging.DEBUG)
+        ch.setLevel(logging.INFO)
         asyncssh_logger.addHandler(ch)
 
         try:
@@ -100,8 +103,7 @@ class SSHManager:
         except OSError as e:
             self.mgr.offline_hosts.add(host)
             log_content = log_string.getvalue()
-            msg = f"Can't communicate with remote host `{addr}`, possibly because python3 is not installed there. {str(e)}" + \
-                '\n' + f'Log: {log_content}'
+            msg = f"Can't communicate with remote host `{addr}`, possibly because python3 is not installed there. {str(e)}"
             logger.exception(msg)
             raise OrchestratorError(msg)
         except asyncssh.Error as e:
@@ -136,9 +138,10 @@ class SSHManager:
         cmd = "sudo " + " ".join(quote(x) for x in cmd)
         logger.debug(f'Running command: {cmd}')
         try:
+            r = await conn.run('sudo true', check=True, timeout=5)
             r = await conn.run(cmd, input=stdin)
         # handle these Exceptions otherwise you might get a weird error like TypeError: __init__() missing 1 required positional argument: 'reason' (due to the asyncssh error interacting with raise_if_exception)
-        except (asyncssh.ChannelOpenError, Exception) as e:
+        except (asyncssh.ChannelOpenError, asyncssh.ProcessError, Exception) as e:
             # SSH connection closed or broken, will create new connection next call
             logger.debug(f'Connection to {host} failed. {str(e)}')
             await self._reset_con(host)

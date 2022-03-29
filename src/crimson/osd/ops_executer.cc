@@ -459,6 +459,19 @@ auto OpsExecuter::do_write_op(Func&& f, bool um) {
   user_modify = um;
   return std::forward<Func>(f)(pg->get_backend(), obc->obs, txn);
 }
+OpsExecuter::call_errorator::future<> OpsExecuter::do_assert_ver(
+  OSDOp& osd_op,
+  const ObjectState& os)
+{
+  if (!osd_op.op.assert_ver.ver) {
+    return crimson::ct_error::invarg::make();
+  } else if (osd_op.op.assert_ver.ver < os.oi.user_version) {
+    return crimson::ct_error::erange::make();
+  } else if (osd_op.op.assert_ver.ver > os.oi.user_version) {
+    return crimson::ct_error::value_too_large::make();
+  }
+  return seastar::now();
+}
 
 OpsExecuter::interruptible_errorated_future<OpsExecuter::osd_op_errorator>
 OpsExecuter::execute_op(OSDOp& osd_op)
@@ -634,6 +647,10 @@ OpsExecuter::execute_op(OSDOp& osd_op)
     return do_read_op([this, &osd_op] (auto&, const auto& os) {
       return do_op_notify_ack(osd_op, os);
     });
+  case CEPH_OSD_OP_ASSERT_VER:
+    return do_read_op([this, &osd_op] (auto&, const auto& os) {
+      return do_assert_ver(osd_op, os);
+    });
 
   default:
     logger().warn("unknown op {}", ceph_osd_op_name(op.op));
@@ -718,7 +735,7 @@ static PG::interruptible_future<hobject_t> pgls_filter(
   if (const auto xattr = filter.get_xattr(); !xattr.empty()) {
     logger().debug("pgls_filter: filter is interested in xattr={} for obj={}",
                    xattr, sobj);
-    return backend.getxattr(sobj, xattr).safe_then_interruptible(
+    return backend.getxattr(sobj, std::move(xattr)).safe_then_interruptible(
       [&filter, sobj] (ceph::bufferlist val) {
         logger().debug("pgls_filter: got xvalue for obj={}", sobj);
 
@@ -819,8 +836,8 @@ static PG::interruptible_future<ceph::bufferlist> do_pgnls_common(
       response.handle = next.is_max() ? pg_end : next;
       ceph::bufferlist out;
       encode(response, out);
-      logger().debug("{}: response.entries.size()=",
-                     __func__, response.entries.size());
+      logger().debug("do_pgnls_common: response.entries.size()= {}",
+                     response.entries.size());
       return seastar::make_ready_future<ceph::bufferlist>(std::move(out));
   });
 }

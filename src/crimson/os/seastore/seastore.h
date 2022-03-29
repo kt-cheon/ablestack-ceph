@@ -11,6 +11,7 @@
 
 #include <optional>
 #include <seastar/core/future.hh>
+#include <seastar/core/metrics_types.hh>
 
 #include "include/uuid.h"
 
@@ -147,7 +148,7 @@ public:
   seastar::future<OmapIteratorRef> get_omap_iterator(
     CollectionRef ch,
     const ghobject_t& oid) final;
-  seastar::future<std::map<uint64_t, uint64_t>> fiemap(
+  read_errorator::future<std::map<uint64_t, uint64_t>> fiemap(
     CollectionRef ch,
     const ghobject_t& oid,
     uint64_t off,
@@ -362,6 +363,20 @@ private:
     internal_context_t &ctx,
     OnodeRef &onode,
     std::map<std::string,bufferlist>&& aset);
+  tm_ret _rmattr(
+    internal_context_t &ctx,
+    OnodeRef &onode,
+    std::string name);
+  tm_ret _rmattrs(
+    internal_context_t &ctx,
+    OnodeRef &onode);
+  tm_ret _xattr_rmattr(
+    internal_context_t &ctx,
+    OnodeRef &onode,
+    std::string &&name);
+  tm_ret _xattr_clear(
+    internal_context_t &ctx,
+    OnodeRef &onode);
   tm_ret _create_collection(
     internal_context_t &ctx,
     const coll_t& cid, int bits);
