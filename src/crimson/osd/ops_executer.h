@@ -42,6 +42,7 @@ class OpsExecuter : public seastar::enable_lw_shared_from_this<OpsExecuter> {
     crimson::ct_error::enoent,
     crimson::ct_error::invarg,
     crimson::ct_error::erange,
+    crimson::ct_error::ecanceled,
     crimson::ct_error::permission_denied,
     crimson::ct_error::operation_not_supported,
     crimson::ct_error::input_output_error,
@@ -226,6 +227,9 @@ private:
   decltype(auto) dont_do_legacy_op() {
     return crimson::ct_error::operation_not_supported::make();
   }
+
+  interruptible_errorated_future<osd_op_errorator>
+  do_execute_op(OSDOp& osd_op);
 
 public:
   template <class MsgT>

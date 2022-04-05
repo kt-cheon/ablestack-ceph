@@ -21,7 +21,7 @@ namespace crimson::os::seastore {
 
 void segment_info_set_t::segment_info_t::set_open(segment_seq_t seq) {
   assert(state == Segment::segment_state_t::EMPTY);
-  assert(segment_seq_to_type(seq) != segment_type_t::NULL_SEG);
+  assert(seq != NULL_SEG_SEQ);
   state = Segment::segment_state_t::OPEN;
   journal_segment_seq = seq;
 }
@@ -183,6 +183,8 @@ SegmentCleaner::SegmentCleaner(
   : detailed(detailed),
     config(config),
     scanner(std::move(scr)),
+    ool_segment_seq_allocator(
+      new SegmentSeqAllocator(segment_type_t::OOL)),
     gc_process(*this)
 {}
 
@@ -236,10 +238,12 @@ void SegmentCleaner::register_metrics()
 }
 
 segment_id_t SegmentCleaner::get_segment(
-    device_id_t device_id, segment_seq_t seq)
+    device_id_t device_id,
+    segment_seq_t seq,
+    segment_type_t type)
 {
   LOG_PREFIX(SegmentCleaner::get_segment);
-  assert(segment_seq_to_type(seq) != segment_type_t::NULL_SEG);
+  assert(seq != NULL_SEG_SEQ);
   for (auto it = segments.device_begin(device_id);
        it != segments.device_end(device_id);
        ++it) {
@@ -247,7 +251,7 @@ segment_id_t SegmentCleaner::get_segment(
     auto& segment_info = it->second;
     if (segment_info.is_empty()) {
       DEBUG("returning segment {} {}", seg_id, segment_seq_printer_t{seq});
-      mark_open(seg_id, seq);
+      mark_open(seg_id, seq, type);
       return seg_id;
     }
   }
@@ -294,8 +298,7 @@ void SegmentCleaner::update_journal_tail_committed(journal_seq_t committed)
 
 void SegmentCleaner::close_segment(segment_id_t segment)
 {
-  ceph_assert(segment_seq_to_type(segments[segment].journal_segment_seq) !=
-              segment_type_t::NULL_SEG);
+  ceph_assert(segments[segment].journal_segment_seq != NULL_SEG_SEQ);
   mark_closed(segment);
 }
 
@@ -574,7 +577,8 @@ SegmentCleaner::mount_ret SegmentCleaner::mount(
 	    }
 	    init_mark_segment_closed(
 	      segment_id,
-	      header.journal_segment_seq);
+	      header.segment_seq,
+	      header.type);
 	    return seastar::now();
 	  }).handle_error(
 	    crimson::ct_error::enodata::handle(
@@ -660,7 +664,8 @@ SegmentCleaner::scan_extents_ret SegmentCleaner::scan_nonfull_segment(
     }).safe_then([this, segment_id, header](auto) {
       init_mark_segment_closed(
 	segment_id,
-	header.journal_segment_seq);
+	header.segment_seq,
+	header.type);
       return seastar::now();
     });
   } else if (header.get_type() == segment_type_t::JOURNAL) {
@@ -673,7 +678,8 @@ SegmentCleaner::scan_extents_ret SegmentCleaner::scan_nonfull_segment(
   }
   init_mark_segment_closed(
     segment_id,
-    header.journal_segment_seq);
+    header.segment_seq,
+    header.type);
   return seastar::now();
 }
 

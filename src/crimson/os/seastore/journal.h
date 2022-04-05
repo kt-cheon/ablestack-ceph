@@ -7,6 +7,7 @@
 
 #include "crimson/os/seastore/ordering_handle.h"
 #include "crimson/os/seastore/seastore_types.h"
+#include "crimson/os/seastore/segment_seq_allocator.h"
 
 namespace crimson::os::seastore {
 

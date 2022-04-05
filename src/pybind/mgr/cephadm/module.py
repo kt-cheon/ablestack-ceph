@@ -58,8 +58,10 @@ from .inventory import Inventory, SpecStore, HostCache, AgentCache, EventStore, 
     ClientKeyringStore, ClientKeyringSpec
 from .upgrade import CephadmUpgrade
 from .template import TemplateMgr
-from .utils import CEPH_IMAGE_TYPES, forall_hosts, cephadmNoImage
+from .utils import CEPH_IMAGE_TYPES, RESCHEDULE_FROM_OFFLINE_HOSTS_TYPES, forall_hosts, \
+    cephadmNoImage
 from .configchecks import CephadmConfigChecks
+from .offline_watcher import OfflineHostWatcher
 
 try:
     import asyncssh
@@ -544,11 +546,15 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
         if self.use_agent:
             self.agent_helpers._apply_agent()
 
+        self.offline_watcher = OfflineHostWatcher(self)
+        self.offline_watcher.start()
+
     def shutdown(self) -> None:
         self.log.debug('shutdown')
         self._worker_pool.close()
         self._worker_pool.join()
         self.cherrypy_thread.shutdown()
+        self.offline_watcher.shutdown()
         self.run = False
         self.event.set()
 
@@ -773,6 +779,12 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule,
         self.cache.update_host_daemons(host, dm)
         self.cache.save_host(host)
         return None
+
+    def update_watched_hosts(self) -> None:
+        # currently, we are watching hosts with nfs daemons
+        hosts_to_watch = [d.hostname for d in self.cache.get_daemons(
+        ) if d.daemon_type in RESCHEDULE_FROM_OFFLINE_HOSTS_TYPES]
+        self.offline_watcher.set_hosts(list(set([h for h in hosts_to_watch if h is not None])))
 
     def offline_hosts_remove(self, host: str) -> None:
         if host in self.offline_hosts:
@@ -1379,7 +1391,7 @@ Then run the following:
 
         :param host: host name
         """
-        spec.validate()
+        HostSpec.validate(spec)
         ip_addr = self._check_valid_addr(spec.hostname, spec.addr)
         if spec.addr == spec.hostname and ip_addr:
             spec.addr = ip_addr
@@ -2228,6 +2240,10 @@ Then run the following:
 
     @handle_orch_error
     def create_osds(self, drive_group: DriveGroupSpec) -> str:
+        hosts: List[HostSpec] = self.inventory.all_specs()
+        filtered_hosts: List[str] = drive_group.placement.filter_matching_hostspecs(hosts)
+        if not filtered_hosts:
+            return "Invalid 'host:device' spec: host not found in cluster. Please check 'ceph orch host ls' for available hosts"
         return self.osd_service.create_from_spec(drive_group)
 
     def _preview_osdspecs(self,

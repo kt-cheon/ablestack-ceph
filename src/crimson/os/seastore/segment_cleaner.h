@@ -16,6 +16,7 @@
 #include "crimson/os/seastore/seastore_types.h"
 #include "crimson/os/seastore/segment_manager.h"
 #include "crimson/os/seastore/transaction.h"
+#include "crimson/os/seastore/segment_seq_allocator.h"
 
 namespace crimson::os::seastore {
 
@@ -58,11 +59,13 @@ class segment_info_set_t {
     // Will be non-null for any segments in the current journal
     segment_seq_t journal_segment_seq = NULL_SEG_SEQ;
 
+    segment_type_t type = segment_type_t::NULL_SEG;
+
     seastar::lowres_system_clock::time_point last_modified;
     seastar::lowres_system_clock::time_point last_rewritten;
 
     segment_type_t get_type() const {
-      return segment_seq_to_type(journal_segment_seq);
+      return type;
     }
 
     void set_open(segment_seq_t);
@@ -287,7 +290,7 @@ private:
 class SegmentProvider {
 public:
   virtual segment_id_t get_segment(
-      device_id_t id, segment_seq_t seq) = 0;
+      device_id_t id, segment_seq_t seq, segment_type_t type) = 0;
 
   virtual void close_segment(segment_id_t) {}
 
@@ -296,6 +299,8 @@ public:
   virtual void update_journal_tail_committed(journal_seq_t tail_committed) = 0;
 
   virtual segment_seq_t get_seq(segment_id_t id) { return 0; }
+
+  virtual segment_type_t get_type(segment_id_t id) = 0;
 
   virtual seastar::lowres_system_clock::time_point get_last_modified(
     segment_id_t id) const = 0;
@@ -716,11 +721,17 @@ private:
   /// populated if there is an IO blocked on hard limits
   std::optional<seastar::promise<>> blocked_io_wake;
 
+  SegmentSeqAllocatorRef ool_segment_seq_allocator;
+
 public:
   SegmentCleaner(
     config_t config,
     ExtentReaderRef&& scanner,
     bool detailed = false);
+
+  SegmentSeqAllocator& get_ool_segment_seq_allocator() {
+    return *ool_segment_seq_allocator;
+  }
 
   using mount_ertr = crimson::errorator<
     crimson::ct_error::input_output_error>;
@@ -728,7 +739,7 @@ public:
   mount_ret mount(device_id_t pdevice_id, std::vector<SegmentManager*>& sms);
 
   segment_id_t get_segment(
-      device_id_t id, segment_seq_t seq) final;
+      device_id_t id, segment_seq_t seq, segment_type_t type) final;
 
   void close_segment(segment_id_t segment) final;
 
@@ -759,6 +770,10 @@ public:
 
   segment_seq_t get_seq(segment_id_t id) final {
     return segments[id].journal_segment_seq;
+  }
+
+  segment_type_t get_type(segment_id_t id) final {
+    return segments[id].get_type();
   }
 
   void mark_segment_released(segment_id_t segment) {
@@ -1316,19 +1331,23 @@ private:
 
   void init_mark_segment_closed(
     segment_id_t segment,
-    segment_seq_t seq) {
+    segment_seq_t seq,
+    segment_type_t s_type) {
     crimson::get_logger(ceph_subsys_seastore_cleaner).debug(
-      "SegmentCleaner::init_mark_segment_closed: segment {}, seq {}",
+      "SegmentCleaner::init_mark_segment_closed: segment {}, seq {}, s_type {}",
       segment,
-      segment_seq_printer_t{seq});
-    ceph_assert(segment_seq_to_type(seq) != segment_type_t::NULL_SEG);
+      segment_seq_printer_t{seq},
+      s_type);
     mark_closed(segment);
     segments[segment].journal_segment_seq = seq;
-    auto s_type = segments[segment].get_type();
     assert(s_type != segment_type_t::NULL_SEG);
+    segments[segment].type = s_type;
     if (s_type == segment_type_t::JOURNAL) {
       assert(journal_device_id == segment.device_id());
       segments.new_journal_segment();
+    } else {
+      assert(s_type == segment_type_t::OOL);
+      ool_segment_seq_allocator->set_next_segment_seq(seq);
     }
   }
 
@@ -1390,7 +1409,7 @@ private:
     maybe_wake_gc_blocked_io();
   }
 
-  void mark_open(segment_id_t segment, segment_seq_t seq) {
+  void mark_open(segment_id_t segment, segment_seq_t seq, segment_type_t s_type) {
     assert(segment.device_id() ==
       segments[segment.device_id()]->device_id);
     assert(segment.device_segment_id() <
@@ -1400,8 +1419,8 @@ private:
     segments.segment_opened(segment);
     auto& segment_info = segments[segment];
     segment_info.set_open(seq);
+    segment_info.type = s_type;
 
-    auto s_type = segment_info.get_type();
     ceph_assert(s_type != segment_type_t::NULL_SEG);
     if (s_type == segment_type_t::JOURNAL) {
       segments.new_journal_segment();
@@ -1409,11 +1428,12 @@ private:
     assert(stats.empty_segments > 0);
     stats.empty_segments--;
     crimson::get_logger(ceph_subsys_seastore_cleaner
-      ).info("mark open: {} {}, empty_segments {}"
+      ).info("mark open: {} {} {}, empty_segments {}"
 	", opened_segments {}, should_block_on_gc {}"
 	", projected_avail_ratio {}, projected_reclaim_ratio {}",
 	segment,
 	segment_seq_printer_t{seq},
+	segment_info.type,
 	stats.empty_segments,
 	segments.get_opened_segments(),
 	should_block_on_gc(),

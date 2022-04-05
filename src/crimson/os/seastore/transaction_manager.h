@@ -549,7 +549,8 @@ public:
       device_type_t::SEGMENTED,
       std::make_unique<SegmentedAllocator>(
 	*segment_cleaner,
-	*sm));
+	*sm,
+	segment_cleaner->get_ool_segment_seq_allocator()));
   }
 
   ~TransactionManager();
