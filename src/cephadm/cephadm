@@ -48,12 +48,12 @@ FuncT = TypeVar('FuncT', bound=Callable)
 DEFAULT_IMAGE = 'quay.ceph.io/ceph-ci/ceph:master'
 DEFAULT_IMAGE_IS_MASTER = True
 DEFAULT_IMAGE_RELEASE = 'quincy'
-DEFAULT_PROMETHEUS_IMAGE = 'quay.io/prometheus/prometheus:v2.18.1'
+DEFAULT_PROMETHEUS_IMAGE = 'quay.io/prometheus/prometheus:v2.33.4'
 DEFAULT_LOKI_IMAGE = 'docker.io/grafana/loki:2.4.0'
 DEFAULT_PROMTAIL_IMAGE = 'docker.io/grafana/promtail:2.4.0'
-DEFAULT_NODE_EXPORTER_IMAGE = 'quay.io/prometheus/node-exporter:v0.18.1'
-DEFAULT_ALERT_MANAGER_IMAGE = 'quay.io/prometheus/alertmanager:v0.20.0'
-DEFAULT_GRAFANA_IMAGE = 'quay.io/ceph/ceph-grafana:6.7.4'
+DEFAULT_NODE_EXPORTER_IMAGE = 'quay.io/prometheus/node-exporter:v1.3.1'
+DEFAULT_ALERT_MANAGER_IMAGE = 'quay.io/prometheus/alertmanager:v0.23.0'
+DEFAULT_GRAFANA_IMAGE = 'quay.io/ceph/ceph-grafana:8.3.5'
 DEFAULT_HAPROXY_IMAGE = 'docker.io/library/haproxy:2.3'
 DEFAULT_KEEPALIVED_IMAGE = 'docker.io/arcts/keepalived'
 DEFAULT_SNMP_GATEWAY_IMAGE = 'docker.io/maxwo/snmp-notifier:v1.2.1'
@@ -209,7 +209,9 @@ class Docker(ContainerEngine):
 CONTAINER_PREFERENCE = (Podman, Docker)  # prefer podman to docker
 
 
-# Log and console output config
+# During normal cephadm operations (cephadm ls, gather-facts, etc ) we use:
+# stdout: for JSON output only
+# stderr: for error, debug, info, etc
 logging_config = {
     'version': 1,
     'disable_existing_loggers': True,
@@ -239,6 +241,56 @@ logging_config = {
 }
 
 
+class ExcludeErrorsFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Only lets through log messages with log level below WARNING ."""
+        return record.levelno < logging.WARNING
+
+
+# During bootstrap operation we use:
+# stdout: for debug and info
+# stderr: for errors and warnings
+bootstrap_logging_config = {
+    'version': 1,
+    'filters': {
+        'exclude_errors': {
+            '()': ExcludeErrorsFilter
+        }
+    },
+    'disable_existing_loggers': True,
+    'formatters': {
+        'cephadm': {
+            'format': '%(asctime)s %(thread)x %(levelname)s %(message)s'
+        },
+    },
+    'handlers': {
+        'console_stdout': {
+            'level': 'INFO',
+            'class': 'logging.StreamHandler',
+            'filters': ['exclude_errors'],
+            'stream': sys.stdout
+        },
+        'console_stderr': {
+            'level': 'WARNING',
+            'class': 'logging.StreamHandler',
+            'stream': sys.stderr
+        },
+        'log_file': {
+            'level': 'DEBUG',
+            'class': 'logging.handlers.WatchedFileHandler',
+            'formatter': 'cephadm',
+            'filename': '%s/cephadm.log' % LOG_DIR,
+        }
+    },
+    'loggers': {
+        '': {
+            'level': 'DEBUG',
+            'handlers': ['console_stdout', 'console_stderr', 'log_file'],
+        }
+    }
+}
+
+
 class termcolor:
     yellow = '\033[93m'
     red = '\033[31m'
@@ -250,6 +302,10 @@ class Error(Exception):
 
 
 class TimeoutExpired(Error):
+    pass
+
+
+class UnauthorizedRegistryError(Error):
     pass
 
 ##################################
@@ -813,10 +869,7 @@ class CephIscsi(object):
         # remove extra container args for tcmu container.
         # extra args could cause issue with forking service type
         tcmu_container.container_args = []
-        # set container limits to unlimited as defaults (Docker 4096 / Podman 2048)
-        # prevents the creation of max lun (default 255)
-        pids_unlimited = '-1' if isinstance(self.ctx.container_engine, Podman) else '0'
-        tcmu_container.container_args.extend(['--pids-limit=%s' % pids_unlimited])
+        set_pids_limit_unlimited(self.ctx, tcmu_container.container_args)
         return tcmu_container
 
 ##################################
@@ -1882,7 +1935,7 @@ def infer_fsid(func: FuncT) -> FuncT:
             logger.info('Inferring fsid %s' % fsids[0])
             ctx.fsid = fsids[0]
         else:
-            raise Error('Cannot infer an fsid, one must be specified: %s' % fsids)
+            raise Error('Cannot infer an fsid, one must be specified (using --fsid): %s' % fsids)
         return func(ctx)
 
     return cast(FuncT, _infer_fsid)
@@ -2401,6 +2454,10 @@ def get_daemon_args(ctx, fsid, daemon_type, daemon_id):
             r += ['--config.file=/etc/loki/loki.yml']
         if daemon_type == 'promtail':
             r += ['--config.file=/etc/promtail/promtail.yml']
+        if daemon_type == 'node-exporter':
+            r += ['--path.procfs=/host/proc',
+                  '--path.sysfs=/host/sys',
+                  '--path.rootfs=/rootfs']
     elif daemon_type == NFSGanesha.daemon_type:
         nfs_ganesha = NFSGanesha.init(ctx, fsid, daemon_id)
         r += nfs_ganesha.get_daemon_args()
@@ -2749,6 +2806,17 @@ def get_ceph_volume_container(ctx: CephadmContext,
     )
 
 
+def set_pids_limit_unlimited(ctx: CephadmContext, container_args: List[str]) -> None:
+    # set container's pids-limit to unlimited rather than default (Docker 4096 / Podman 2048)
+    # Useful for daemons like iscsi where the default pids-limit limits the number of luns
+    # per iscsi target or rgw where increasing the rgw_thread_pool_size to a value near
+    # the default pids-limit may cause the container to crash.
+    if isinstance(ctx.container_engine, Podman):
+        container_args.append('--pids-limit=-1')
+    else:
+        container_args.append('--pids-limit=0')
+
+
 def get_container(ctx: CephadmContext,
                   fsid: str, daemon_type: str, daemon_id: Union[int, str],
                   privileged: bool = False,
@@ -2770,6 +2838,7 @@ def get_container(ctx: CephadmContext,
     if daemon_type == 'rgw':
         entrypoint = '/usr/bin/radosgw'
         name = 'client.rgw.%s' % daemon_id
+        set_pids_limit_unlimited(ctx, container_args)
     elif daemon_type == 'rbd-mirror':
         entrypoint = '/usr/bin/rbd-mirror'
         name = 'client.rbd-mirror.%s' % daemon_id
@@ -2803,6 +2872,7 @@ def get_container(ctx: CephadmContext,
         # So the container can modprobe iscsi_target_mod and have write perms
         # to configfs we need to make this a privileged container.
         privileged = True
+        set_pids_limit_unlimited(ctx, container_args)
     elif daemon_type == CustomContainer.daemon_type:
         cc = CustomContainer.init(ctx, fsid, daemon_id)
         entrypoint = cc.entrypoint
@@ -2819,6 +2889,11 @@ def get_container(ctx: CephadmContext,
             # by ubuntu 18.04 kernel!)
         ]
         container_args.extend(monitoring_args)
+        if daemon_type == 'node-exporter':
+            # in order to support setting '--path.procfs=/host/proc','--path.sysfs=/host/sys',
+            # '--path.rootfs=/rootfs' for node-exporter we need to disable selinux separation
+            # between the node-exporter container and the host to avoid selinux denials
+            container_args.extend(['--security-opt', 'label=disable'])
     elif daemon_type == 'crash':
         ceph_args = ['-n', name]
     elif daemon_type in Ceph.daemons:
@@ -2831,8 +2906,6 @@ def get_container(ctx: CephadmContext,
 
     # if using podman, set -d, --conmon-pidfile & --cidfile flags
     # so service can have Type=Forking
-    # set containers limits to unlimited as defaults (Docker 4096 / Podman 2048)
-    # prevents some app customizations from running
     if isinstance(ctx.container_engine, Podman):
         runtime_dir = '/run'
         container_args.extend([
@@ -2841,14 +2914,9 @@ def get_container(ctx: CephadmContext,
             runtime_dir + '/ceph-%s@%s.%s.service-pid' % (fsid, daemon_type, daemon_id),
             '--cidfile',
             runtime_dir + '/ceph-%s@%s.%s.service-cid' % (fsid, daemon_type, daemon_id),
-            '--pids-limit=-1',
         ])
         if ctx.container_engine.version >= CGROUPS_SPLIT_PODMAN_VERSION:
             container_args.append('--cgroups=split')
-    else:
-        container_args.extend([
-            '--pids-limit=0',
-        ])
 
     return CephContainer.for_daemon(
         ctx,
@@ -4256,7 +4324,12 @@ def command_version(ctx):
 def command_pull(ctx):
     # type: (CephadmContext) -> int
 
-    _pull_image(ctx, ctx.image, ctx.insecure)
+    try:
+        _pull_image(ctx, ctx.image, ctx.insecure)
+    except UnauthorizedRegistryError:
+        err_str = 'Failed to pull container image. Check that host(s) are logged into the registry'
+        logger.debug(f'Pulling image for `command_pull` failed: {err_str}')
+        raise Error(err_str)
     return command_inspect_image(ctx)
 
 
@@ -4283,6 +4356,9 @@ def _pull_image(ctx, image, insecure=False):
         out, err, ret = call(ctx, cmd)
         if not ret:
             return
+
+        if 'unauthorized' in err:
+            raise UnauthorizedRegistryError()
 
         if not any(pattern in err for pattern in ignorelist):
             raise Error('Failed command: %s' % cmd_str)
@@ -5100,7 +5176,12 @@ def command_bootstrap(ctx):
     config = prepare_bootstrap_config(ctx, fsid, addr_arg, ctx.image)
 
     if not ctx.skip_pull:
-        _pull_image(ctx, ctx.image)
+        try:
+            _pull_image(ctx, ctx.image)
+        except UnauthorizedRegistryError:
+            err_str = 'Failed to pull container image. Check that correct registry credentials are provided in bootstrap by --registry-url, --registry-username, --registry-password, or supply --registry-json with credentials'
+            logger.debug(f'Pulling image for bootstrap on {hostname} failed: {err_str}')
+            raise Error(err_str)
 
     image_ver = CephContainer(ctx, ctx.image, 'ceph', ['--version']).run().strip()
     logger.info(f'Ceph version: {image_ver}')
@@ -5257,12 +5338,15 @@ def command_bootstrap(ctx):
     # Notify the Dashboard to show the 'Expand cluster' page on first log in.
     cli(['config-key', 'set', 'mgr/dashboard/cluster/status', 'INSTALLED'])
 
-    logger.info('You can access the Ceph CLI with:\n\n'
+    logger.info('You can access the Ceph CLI as following in case of multi-cluster or non-default config:\n\n'
                 '\tsudo %s shell --fsid %s -c %s -k %s\n' % (
                     sys.argv[0],
                     fsid,
                     ctx.output_config,
                     ctx.output_keyring))
+
+    logger.info('Or, if you are only running a single cluster on this host:\n\n\tsudo %s shell \n' % (sys.argv[0]))
+
     logger.info('Please consider enabling telemetry to help improve Ceph:\n\n'
                 '\tceph telemetry on\n\n'
                 'For more information see:\n\n'
@@ -6100,7 +6184,12 @@ def command_adopt(ctx):
     # type: (CephadmContext) -> None
 
     if not ctx.skip_pull:
-        _pull_image(ctx, ctx.image)
+        try:
+            _pull_image(ctx, ctx.image)
+        except UnauthorizedRegistryError:
+            err_str = 'Failed to pull container image. Host may not be logged into container registry. Try `cephadm registry-login --registry-url <url> --registry-username <username> --registry-password <password>` or supply login info via a json file with `cephadm registry-login --registry-json <file>`'
+            logger.debug(f'Pulling image for `command_adopt` failed: {err_str}')
+            raise Error(err_str)
 
     (daemon_type, daemon_id) = ctx.name.split('.', 1)
 
@@ -8691,7 +8780,11 @@ def cephadm_init_logging(ctx: CephadmContext, args: List[str]) -> None:
     global logger
     if not os.path.exists(LOG_DIR):
         os.makedirs(LOG_DIR)
-    dictConfig(logging_config)
+    if 'bootstrap' in args:
+        dictConfig(bootstrap_logging_config)
+    else:
+        dictConfig(logging_config)
+
     logger = logging.getLogger()
 
     if not os.path.exists(ctx.logrotate_dir + '/cephadm'):
