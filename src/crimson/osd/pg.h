@@ -31,6 +31,7 @@
 #include "crimson/osd/osd_operations/background_recovery.h"
 #include "crimson/osd/shard_services.h"
 #include "crimson/osd/osdmap_gate.h"
+#include "crimson/osd/pg_activation_blocker.h"
 #include "crimson/osd/pg_recovery.h"
 #include "crimson/osd/pg_recovery_listener.h"
 #include "crimson/osd/recovery_backend.h"
@@ -54,7 +55,6 @@ namespace crimson::os {
 }
 
 namespace crimson::osd {
-class ClientRequest;
 class OpsExecuter;
 
 class PG : public boost::intrusive_ref_counter<
@@ -68,8 +68,10 @@ class PG : public boost::intrusive_ref_counter<
   using cached_map_t = boost::local_shared_ptr<const OSDMap>;
 
   ClientRequest::PGPipeline client_request_pg_pipeline;
-  PeeringEvent::PGPipeline peering_request_pg_pipeline;
+  PGPeeringPipeline peering_request_pg_pipeline;
   RepRequest::PGPipeline replicated_request_pg_pipeline;
+
+  ClientRequest::Orderer client_request_orderer;
 
   spg_t pgid;
   pg_shard_t pg_whoami;
@@ -613,7 +615,7 @@ private:
     eversion_t& v);
 
 private:
-  OSDMapGate osdmap_gate;
+  PG_OSDMapGate osdmap_gate;
   ShardServices &shard_services;
 
   cached_map_t osdmap;
@@ -721,28 +723,13 @@ private:
   // continuations here.
   bool stopping = false;
 
-  class WaitForActiveBlocker : public BlockerT<WaitForActiveBlocker> {
-    PG *pg;
-
-    const spg_t pgid;
-    seastar::shared_promise<> p;
-
-  protected:
-    void dump_detail(Formatter *f) const;
-
-  public:
-    static constexpr const char *type_name = "WaitForActiveBlocker";
-
-    WaitForActiveBlocker(PG *pg) : pg(pg) {}
-    void on_active();
-    blocking_future<> wait();
-    seastar::future<> stop();
-  } wait_for_active_blocker;
+  PGActivationBlocker wait_for_active_blocker;
 
   friend std::ostream& operator<<(std::ostream&, const PG& pg);
   friend class ClientRequest;
   friend struct CommonClientRequest;
   friend class PGAdvanceMap;
+  template <class T>
   friend class PeeringEvent;
   friend class RepRequest;
   friend class BackfillRecovery;
@@ -795,6 +782,10 @@ struct PG::do_osd_ops_params_t {
   uint64_t get_features() const {
     return features;
   }
+  // Only used by InternalClientRequest, no op flags
+  bool has_flag(uint32_t flag) const {
+    return false;
+ }
   crimson::net::ConnectionRef conn;
   osd_reqid_t reqid;
   utime_t mtime;

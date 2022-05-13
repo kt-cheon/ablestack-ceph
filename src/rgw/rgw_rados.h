@@ -581,16 +581,16 @@ public:
 
   CephContext *ctx() { return cct; }
   /** do all necessary setup of the storage device */
-  int initialize(CephContext *_cct, const DoutPrefixProvider *dpp) {
+  int init_begin(CephContext *_cct, const DoutPrefixProvider *dpp) {
     set_context(_cct);
-    return initialize(dpp);
+    return init_begin(dpp);
   }
   /** Initialize the RADOS instance and prepare to do other ops */
   int init_svc(bool raw, const DoutPrefixProvider *dpp);
   int init_ctl(const DoutPrefixProvider *dpp);
   virtual int init_rados();
+  int init_begin(const DoutPrefixProvider *dpp);
   int init_complete(const DoutPrefixProvider *dpp);
-  int initialize(const DoutPrefixProvider *dpp);
   void finalize();
 
   int register_to_service_map(const DoutPrefixProvider *dpp, const std::string& daemon_type, const std::map<std::string, std::string>& meta);
@@ -1494,7 +1494,7 @@ public:
   int fix_tail_obj_locator(const DoutPrefixProvider *dpp, const RGWBucketInfo& bucket_info, rgw_obj_key& key, bool fix, bool *need_fix, optional_yield y);
 
   int check_quota(const DoutPrefixProvider *dpp, const rgw_user& bucket_owner, rgw_bucket& bucket,
-                  RGWQuotaInfo& user_quota, RGWQuotaInfo& bucket_quota, uint64_t obj_size,
+                  RGWQuota& quota, uint64_t obj_size,
 		  optional_yield y, bool check_size_only = false);
 
   int check_bucket_shards(const RGWBucketInfo& bucket_info, const rgw_bucket& bucket,
