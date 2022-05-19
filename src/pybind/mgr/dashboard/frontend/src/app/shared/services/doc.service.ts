@@ -27,6 +27,7 @@ export class DocService {
     const docVersion = release === 'master' ? 'latest' : release;
     const domain = `https://docs.ceph.com/en/${docVersion}/`;
     const domainCeph = `https://ceph.io/`;
+    const domainAblestack = `https://docs.ablecloud.io/`;
 
     const sections = {
       iscsi: `${domain}mgr/dashboard/#enabling-iscsi-management`,
@@ -34,13 +35,14 @@ export class DocService {
       'nfs-ganesha': `${domain}mgr/dashboard/#configuring-nfs-ganesha-in-the-dashboard`,
       'rgw-nfs': `${domain}radosgw/nfs`,
       rgw: `${domain}mgr/dashboard/#enabling-the-object-gateway-management-frontend`,
-      dashboard: `${domain}mgr/dashboard`,
+      // dashboard: `${domain}mgr/dashboard`,
+      dashboard: `${domainAblestack}`,
       grafana: `${domain}mgr/dashboard/#enabling-the-embedding-of-grafana-dashboards`,
       orch: `${domain}mgr/orchestrator`,
       pgs: `${domainCeph}pgcalc`,
-      help: `${domainCeph}help/`,
-      security: `${domainCeph}security/`,
-      trademarks: `${domainCeph}legal-page/trademarks/`,
+      // help: `${domainCeph}help/`,
+      // security: `${domainCeph}security/`,
+      // trademarks: `${domainCeph}legal-page/trademarks/`,
       'dashboard-landing-page-status': `${domain}mgr/dashboard/#dashboard-landing-page-status`,
       'dashboard-landing-page-performance': `${domain}mgr/dashboard/#dashboard-landing-page-performance`,
       'dashboard-landing-page-capacity': `${domain}mgr/dashboard/#dashboard-landing-page-capacity`
