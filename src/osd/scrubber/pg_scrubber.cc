@@ -503,7 +503,10 @@ void PgScrubber::on_primary_change(const requested_scrub_t& request_flags)
 	   << dendl;
 
   if (is_primary()) {
-    auto suggested = determine_scrub_time(request_flags);
+    auto suggested = m_osds->get_scrub_services().determine_scrub_time(
+      request_flags,
+      m_pg->info,
+      m_pg->get_pgpool().info.opts);
     m_osds->get_scrub_services().register_with_osd(m_scrub_job, suggested);
   } else {
     m_osds->get_scrub_services().remove_from_osd_queue(m_scrub_job);
@@ -534,49 +537,14 @@ void PgScrubber::update_scrub_job(const requested_scrub_t& request_flags)
   }
 
   if (is_primary() && m_scrub_job) {
-    auto suggested = determine_scrub_time(request_flags);
+    auto suggested = m_osds->get_scrub_services().determine_scrub_time(
+      request_flags,
+      m_pg->info,
+      m_pg->get_pgpool().info.opts);
     m_osds->get_scrub_services().update_job(m_scrub_job, suggested);
   }
 
   dout(15) << __func__ << " done " << registration_state() << dendl;
-}
-
-ScrubQueue::sched_params_t PgScrubber::determine_scrub_time(
-  const requested_scrub_t& request_flags) const
-{
-  ScrubQueue::sched_params_t res;
-
-  if (!is_primary()) {
-    return res;	 // with ok_to_scrub set to 'false'
-  }
-
-  if (request_flags.must_scrub || request_flags.need_auto) {
-
-    // Set the smallest time that isn't utime_t()
-    res.proposed_time = PgScrubber::scrub_must_stamp();
-    res.is_must = ScrubQueue::must_scrub_t::mandatory;
-    // we do not need the interval data in this case
-
-  } else if (m_pg->info.stats.stats_invalid &&
-	     m_pg->get_cct()->_conf->osd_scrub_invalid_stats) {
-    res.proposed_time = ceph_clock_now();
-    res.is_must = ScrubQueue::must_scrub_t::mandatory;
-
-  } else {
-    res.proposed_time = m_pg->info.history.last_scrub_stamp;
-    res.min_interval =
-      m_pg->get_pool().info.opts.value_or(pool_opts_t::SCRUB_MIN_INTERVAL, 0.0);
-    res.max_interval =
-      m_pg->get_pool().info.opts.value_or(pool_opts_t::SCRUB_MAX_INTERVAL, 0.0);
-  }
-
-  dout(15) << __func__ << " suggested: " << res.proposed_time
-	   << " hist: " << m_pg->info.history.last_scrub_stamp
-	   << " v:" << m_pg->info.stats.stats_invalid << " / "
-	   << m_pg->cct->_conf->osd_scrub_invalid_stats << " must:"
-	   << (res.is_must == ScrubQueue::must_scrub_t::mandatory ? "y" : "n")
-	   << " pool min: " << res.min_interval << dendl;
-  return res;
 }
 
 void PgScrubber::scrub_requested(scrub_level_t scrub_level,
@@ -1022,7 +990,6 @@ void PgScrubber::on_init()
 
   m_be = std::make_unique<ScrubBackend>(
     *this,
-    *(m_pg->get_pgbackend()),
     *m_pg,
     m_pg_whoami,
     m_is_repair,
@@ -1048,7 +1015,6 @@ void PgScrubber::on_replica_init()
 {
   m_be = std::make_unique<ScrubBackend>(
     *this,
-    *(m_pg->get_pgbackend()),
     *m_pg,
     m_pg_whoami,
     m_is_repair,
@@ -1191,11 +1157,59 @@ int PgScrubber::build_scrub_map_chunk(ScrubMap& map,
   // finish
   dout(20) << __func__ << " finishing" << dendl;
   ceph_assert(pos.done());
-  m_be->repair_oinfo_oid(map);
+  repair_oinfo_oid(map);
 
   dout(20) << __func__ << " done, got " << map.objects.size() << " items"
 	   << dendl;
   return 0;
+}
+
+/// \todo consider moving repair_oinfo_oid() back to the backend
+void PgScrubber::repair_oinfo_oid(ScrubMap& smap)
+{
+  for (auto i = smap.objects.rbegin(); i != smap.objects.rend(); ++i) {
+
+    const hobject_t& hoid = i->first;
+    ScrubMap::object& o = i->second;
+
+    if (o.attrs.find(OI_ATTR) == o.attrs.end()) {
+      continue;
+    }
+    bufferlist bl;
+    bl.push_back(o.attrs[OI_ATTR]);
+    object_info_t oi;
+    try {
+      oi.decode(bl);
+    } catch (...) {
+      continue;
+    }
+
+    if (oi.soid != hoid) {
+      ObjectStore::Transaction t;
+      OSDriver::OSTransaction _t(m_pg->osdriver.get_transaction(&t));
+
+      m_osds->clog->error()
+        << "osd." << m_pg_whoami << " found object info error on pg " << m_pg_id
+        << " oid " << hoid << " oid in object info: " << oi.soid
+        << "...repaired";
+      // Fix object info
+      oi.soid = hoid;
+      bl.clear();
+      encode(oi,
+             bl,
+             m_pg->get_osdmap()->get_features(CEPH_ENTITY_TYPE_OSD, nullptr));
+
+      bufferptr bp(bl.c_str(), bl.length());
+      o.attrs[OI_ATTR] = bp;
+
+      t.setattr(m_pg->coll, ghobject_t(hoid), OI_ATTR, bl);
+      int r = m_pg->osd->store->queue_transaction(m_pg->ch, std::move(t));
+      if (r != 0) {
+        derr << __func__ << ": queue_transaction got " << cpp_strerror(r)
+             << dendl;
+      }
+    }
+  }
 }
 
 
@@ -2282,8 +2296,9 @@ const OSDMapRef& PgScrubber::get_osdmap() const
   return m_pg->get_osdmap();
 }
 
-ostream& operator<<(ostream& out, const PgScrubber& scrubber)
-{
+LoggerSinkSet& PgScrubber::get_logger() const { return*m_osds->clog.get(); }
+
+ostream &operator<<(ostream &out, const PgScrubber &scrubber) {
   return out << scrubber.m_flags;
 }
 

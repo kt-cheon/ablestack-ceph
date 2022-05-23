@@ -648,10 +648,9 @@ struct seg_paddr_t : public paddr_t {
    */
   paddr_t maybe_relative_to(paddr_t base) const {
     assert(!base.is_block_relative());
-    seg_paddr_t& s = base.as_seg_paddr();
-    if (is_block_relative())
-      return s.add_block_relative(*this);
-    else
+    if (is_block_relative()) {
+      return base.add_block_relative(*this);
+    } else
       return *this;
   }
 };
@@ -681,6 +680,31 @@ struct blk_paddr_t : public paddr_t {
 
   paddr_t add_offset(seastore_off_t o) const {
     return paddr_t::make_blk_paddr(get_device_id(), get_block_off() + o);
+  }
+
+  paddr_t add_relative(paddr_t o) const {
+    seastore_off_t off;
+    ceph_assert(o.get_addr_type() == addr_types_t::SEGMENT);
+    // segment addr is allocated when alloc_new_extent is called.
+    // But, if random block device is used,
+    // segment-based relative addr needs to be added to block addr
+    off = o.as_seg_paddr().get_segment_off();
+    return add_offset(off);
+  }
+
+  // all blk_paddr_t are absolute, relative addrs are always segmented
+  paddr_t maybe_relative_to(paddr_t base) const {
+    return *this;
+  }
+
+  paddr_t add_block_relative(paddr_t o) const {
+    assert(o.is_block_relative());
+    return add_relative(o);
+  }
+
+  paddr_t add_record_relative(paddr_t o) const {
+    assert(o.is_record_relative());
+    return add_relative(o);
   }
 
 private:
@@ -772,9 +796,45 @@ struct journal_seq_t {
     denc(v.offset, p);
     DENC_FINISH(p);
   }
+
+  bool operator==(const journal_seq_t &o) const { return cmp(o) == 0; }
+  bool operator!=(const journal_seq_t &o) const { return cmp(o) != 0; }
+  bool operator<(const journal_seq_t &o) const { return cmp(o) < 0; }
+  bool operator<=(const journal_seq_t &o) const { return cmp(o) <= 0; }
+  bool operator>(const journal_seq_t &o) const { return cmp(o) > 0; }
+  bool operator>=(const journal_seq_t &o) const { return cmp(o) >= 0; }
+
+private:
+  int cmp(const journal_seq_t &other) const {
+    if (segment_seq > other.segment_seq) {
+      return 1;
+    } else if (segment_seq < other.segment_seq) {
+      return -1;
+    }
+    using ret_t = std::pair<int64_t, segment_id_t>;
+    auto to_pair = [](const paddr_t &addr) -> ret_t {
+      if (addr.get_addr_type() == addr_types_t::SEGMENT) {
+	auto &seg_addr = addr.as_seg_paddr();
+	return ret_t(seg_addr.get_segment_off(), seg_addr.get_segment_id());
+      } else if (addr.get_addr_type() == addr_types_t::RANDOM_BLOCK) {
+	auto &blk_addr = addr.as_blk_paddr();
+	return ret_t(blk_addr.get_block_off(), MAX_SEG_ID);
+      } else {
+	assert(0 == "impossible");
+	return ret_t(0, MAX_SEG_ID);
+      }
+    };
+    auto left = to_pair(offset);
+    auto right = to_pair(other.offset);
+    if (left > right) {
+      return 1;
+    } else if (left < right) {
+      return -1;
+    } else {
+      return 0;
+    }
+  }
 };
-WRITE_CMP_OPERATORS_2(journal_seq_t, segment_seq, offset)
-WRITE_EQ_OPERATORS_2(journal_seq_t, segment_seq, offset)
 
 std::ostream &operator<<(std::ostream &out, const journal_seq_t &seq);
 
@@ -1749,24 +1809,28 @@ inline paddr_t paddr_t::add_offset(int32_t o) const {
 
 inline paddr_t paddr_t::add_relative(paddr_t o) const {
   PADDR_OPERATION(addr_types_t::SEGMENT, seg_paddr_t, add_relative(o))
+  PADDR_OPERATION(addr_types_t::RANDOM_BLOCK, blk_paddr_t, add_relative(o))
   ceph_assert(0 == "not supported type");
   return P_ADDR_NULL;
 }
 
 inline paddr_t paddr_t::add_block_relative(paddr_t o) const {
   PADDR_OPERATION(addr_types_t::SEGMENT, seg_paddr_t, add_block_relative(o))
+  PADDR_OPERATION(addr_types_t::RANDOM_BLOCK, blk_paddr_t, add_block_relative(o))
   ceph_assert(0 == "not supported type");
   return P_ADDR_NULL;
 }
 
 inline paddr_t paddr_t::add_record_relative(paddr_t o) const {
   PADDR_OPERATION(addr_types_t::SEGMENT, seg_paddr_t, add_record_relative(o))
+  PADDR_OPERATION(addr_types_t::RANDOM_BLOCK, blk_paddr_t, add_record_relative(o))
   ceph_assert(0 == "not supported type");
   return P_ADDR_NULL;
 }
 
 inline paddr_t paddr_t::maybe_relative_to(paddr_t o) const {
   PADDR_OPERATION(addr_types_t::SEGMENT, seg_paddr_t, maybe_relative_to(o))
+  PADDR_OPERATION(addr_types_t::RANDOM_BLOCK, blk_paddr_t, maybe_relative_to(o))
   ceph_assert(0 == "not supported type");
   return P_ADDR_NULL;
 }

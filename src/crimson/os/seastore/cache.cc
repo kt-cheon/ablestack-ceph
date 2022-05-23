@@ -126,8 +126,10 @@ void Cache::register_metrics()
     {src_t::MUTATE, sm::label_instance("src", "MUTATE")},
     {src_t::READ, sm::label_instance("src", "READ")},
     {src_t::CLEANER_TRIM, sm::label_instance("src", "CLEANER_TRIM")},
+    {src_t::TRIM_BACKREF, sm::label_instance("src", "TRIM_BACKREF")},
     {src_t::CLEANER_RECLAIM, sm::label_instance("src", "CLEANER_RECLAIM")},
   };
+  assert(labels_by_src.size() == (std::size_t)src_t::MAX);
 
   std::map<extent_types_t, sm::label_instance> labels_by_ext {
     {extent_types_t::ROOT,                sm::label_instance("ext", "ROOT")},
@@ -140,9 +142,13 @@ void Cache::register_metrics()
     {extent_types_t::OBJECT_DATA_BLOCK,   sm::label_instance("ext", "OBJECT_DATA_BLOCK")},
     {extent_types_t::RETIRED_PLACEHOLDER, sm::label_instance("ext", "RETIRED_PLACEHOLDER")},
     {extent_types_t::ALLOC_INFO,      	  sm::label_instance("ext", "ALLOC_INFO")},
+    {extent_types_t::ALLOC_TAIL,          sm::label_instance("ext", "ALLOC_TAIL")},
     {extent_types_t::TEST_BLOCK,          sm::label_instance("ext", "TEST_BLOCK")},
-    {extent_types_t::TEST_BLOCK_PHYSICAL, sm::label_instance("ext", "TEST_BLOCK_PHYSICAL")}
+    {extent_types_t::TEST_BLOCK_PHYSICAL, sm::label_instance("ext", "TEST_BLOCK_PHYSICAL")},
+    {extent_types_t::BACKREF_INTERNAL,    sm::label_instance("ext", "BACKREF_INTERNAL")},
+    {extent_types_t::BACKREF_LEAF,        sm::label_instance("ext", "BACKREF_LEAF")}
   };
+  assert(labels_by_ext.size() == (std::size_t)extent_types_t::NONE);
 
   /*
    * trans_created
@@ -486,8 +492,10 @@ void Cache::register_metrics()
    */
   auto tree_label = sm::label("tree");
   auto onode_label = tree_label("ONODE");
+  auto omap_label = tree_label("OMAP");
   auto lba_label = tree_label("LBA");
-  auto register_tree_metrics = [&labels_by_src, &onode_label, this](
+  auto backref_label = tree_label("BACKREF");
+  auto register_tree_metrics = [&labels_by_src, &onode_label, &omap_label, this](
       const sm::label_instance& tree_label,
       uint64_t& tree_depth,
       counter_by_src_t<tree_efforts_t>& committed_tree_efforts,
@@ -508,10 +516,10 @@ void Cache::register_metrics()
         // READ transaction won't contain any tree inserts and erases
         continue;
       }
-      if ((src == src_t::CLEANER_TRIM ||
-           src == src_t::CLEANER_RECLAIM) &&
-          tree_label == onode_label) {
-        // CLEANER transaction won't contain any onode tree operations
+      if (is_cleaner_transaction(src) &&
+          (tree_label == onode_label ||
+           tree_label == omap_label)) {
+        // CLEANER transaction won't contain any onode/omap tree operations
         continue;
       }
       auto& committed_efforts = get_by_src(committed_tree_efforts, src);
@@ -532,6 +540,12 @@ void Cache::register_metrics()
             {tree_label, src_label}
           ),
           sm::make_counter(
+            "tree_updates_committed",
+            committed_efforts.num_updates,
+            sm::description("total number of committed update operations"),
+            {tree_label, src_label}
+          ),
+          sm::make_counter(
             "tree_inserts_invalidated",
             invalidated_efforts.num_inserts,
             sm::description("total number of invalidated insert operations"),
@@ -541,6 +555,12 @@ void Cache::register_metrics()
             "tree_erases_invalidated",
             invalidated_efforts.num_erases,
             sm::description("total number of invalidated erase operations"),
+            {tree_label, src_label}
+          ),
+          sm::make_counter(
+            "tree_updates_invalidated",
+            invalidated_efforts.num_updates,
+            sm::description("total number of invalidated update operations"),
             {tree_label, src_label}
           ),
         }
@@ -553,10 +573,20 @@ void Cache::register_metrics()
       stats.committed_onode_tree_efforts,
       stats.invalidated_onode_tree_efforts);
   register_tree_metrics(
+      omap_label,
+      stats.omap_tree_depth,
+      stats.committed_omap_tree_efforts,
+      stats.invalidated_omap_tree_efforts);
+  register_tree_metrics(
       lba_label,
       stats.lba_tree_depth,
       stats.committed_lba_tree_efforts,
       stats.invalidated_lba_tree_efforts);
+  register_tree_metrics(
+      backref_label,
+      stats.backref_tree_depth,
+      stats.committed_backref_tree_efforts,
+      stats.invalidated_backref_tree_efforts);
 
   /**
    * conflict combinations
@@ -577,8 +607,8 @@ void Cache::register_metrics()
            src2 == Transaction::src_t::CLEANER_TRIM) ||
           (src1 == Transaction::src_t::CLEANER_RECLAIM &&
            src2 == Transaction::src_t::CLEANER_RECLAIM) ||
-          (src1 == Transaction::src_t::CLEANER_TRIM &&
-           src2 == Transaction::src_t::CLEANER_RECLAIM)) {
+          (src1 == Transaction::src_t::TRIM_BACKREF &&
+           src2 == Transaction::src_t::TRIM_BACKREF)) {
         continue;
       }
       std::ostringstream oss;
@@ -615,6 +645,35 @@ void Cache::register_metrics()
       }
     );
   }
+
+  /**
+   * rewrite version
+   */
+  metrics.add_group(
+    "cache",
+    {
+      sm::make_counter(
+        "version_count_dirty",
+        stats.committed_dirty_version.num,
+        sm::description("total number of rewrite-dirty extents")
+      ),
+      sm::make_counter(
+        "version_sum_dirty",
+        stats.committed_dirty_version.version,
+        sm::description("sum of the version from rewrite-dirty extents")
+      ),
+      sm::make_counter(
+        "version_count_reclaim",
+        stats.committed_reclaim_version.num,
+        sm::description("total number of rewrite-reclaim extents")
+      ),
+      sm::make_counter(
+        "version_sum_reclaim",
+        stats.committed_reclaim_version.version,
+        sm::description("sum of the version from rewrite-reclaim extents")
+      ),
+    }
+  );
 }
 
 void Cache::add_extent(CachedExtentRef ref)
@@ -788,17 +847,21 @@ void Cache::mark_transaction_conflicted(
     auto ool_record_bytes = (ool_stats.md_bytes + ool_stats.get_data_bytes());
     efforts.ool_record_bytes += ool_record_bytes;
 
-    if (t.get_src() == Transaction::src_t::CLEANER_TRIM ||
-        t.get_src() == Transaction::src_t::CLEANER_RECLAIM) {
-      // CLEANER transaction won't contain any onode tree operations
+    if (is_cleaner_transaction(t.get_src())) {
+      // CLEANER transaction won't contain any onode/omap tree operations
       assert(t.onode_tree_stats.is_clear());
+      assert(t.omap_tree_stats.is_clear());
     } else {
       get_by_src(stats.invalidated_onode_tree_efforts, t.get_src()
           ).increment(t.onode_tree_stats);
+      get_by_src(stats.invalidated_omap_tree_efforts, t.get_src()
+          ).increment(t.omap_tree_stats);
     }
 
     get_by_src(stats.invalidated_lba_tree_efforts, t.get_src()
         ).increment(t.lba_tree_stats);
+    get_by_src(stats.invalidated_backref_tree_efforts, t.get_src()
+        ).increment(t.backref_tree_stats);
 
     SUBDEBUGT(seastore_t,
         "discard {} read, {} fresh, {} delta, {} retire, {}({}B) ool-records",
@@ -816,7 +879,9 @@ void Cache::mark_transaction_conflicted(
     assert(t.mutated_block_list.empty());
     assert(t.get_ool_write_stats().is_clear());
     assert(t.onode_tree_stats.is_clear());
+    assert(t.omap_tree_stats.is_clear());
     assert(t.lba_tree_stats.is_clear());
+    assert(t.backref_tree_stats.is_clear());
     SUBDEBUGT(seastore_t, "discard {} read", t, read_stat);
   }
 }
@@ -844,7 +909,9 @@ void Cache::on_transaction_destruct(Transaction& t)
     assert(t.get_fresh_block_stats().is_clear());
     assert(t.mutated_block_list.empty());
     assert(t.onode_tree_stats.is_clear());
+    assert(t.omap_tree_stats.is_clear());
     assert(t.lba_tree_stats.is_clear());
+    assert(t.backref_tree_stats.is_clear());
   }
 }
 
@@ -996,7 +1063,8 @@ record_t Cache::prepare_record(
     } else {
       auto sseq = NULL_SEG_SEQ;
       auto stype = segment_type_t::NULL_SEG;
-      if (cleaner != nullptr) {
+      if (cleaner != nullptr && i->get_paddr().get_addr_type() ==
+	  addr_types_t::SEGMENT) {
         auto sid = i->get_paddr().as_seg_paddr().get_segment_id();
         auto &sinfo = cleaner->get_seg_info(sid);
         sseq = sinfo.seq;
@@ -1078,7 +1146,7 @@ record_t Cache::prepare_record(
     if (t.get_src() == Transaction::src_t::MUTATE) {
       i->set_last_modified(commit_time);
     } else {
-      assert(t.get_src() >= Transaction::src_t::CLEANER_TRIM);
+      assert(is_cleaner_transaction(t.get_src()));
       i->set_last_rewritten(commit_time);
     }
 
@@ -1134,7 +1202,7 @@ record_t Cache::prepare_record(
     record.push_back(std::move(delta));
   }
 
-  if (t.is_cleaner_transaction()) {
+  if (is_cleaner_transaction(trans_src)) {
     bufferlist bl;
     encode(get_oldest_backref_dirty_from().value_or(JOURNAL_SEQ_NULL), bl);
     delta_info_t delta;
@@ -1155,7 +1223,9 @@ record_t Cache::prepare_record(
     SUBINFOT(seastore_t,
         "record to submit is empty, src={}", t, trans_src);
     assert(t.onode_tree_stats.is_clear());
+    assert(t.omap_tree_stats.is_clear());
     assert(t.lba_tree_stats.is_clear());
+    assert(t.backref_tree_stats.is_clear());
     assert(ool_stats.is_clear());
   }
 
@@ -1175,16 +1245,18 @@ record_t Cache::prepare_record(
       ool_stats.get_data_bytes(),
       record.size.get_raw_mdlength(),
       record.size.dlength);
-  if (trans_src == Transaction::src_t::CLEANER_TRIM ||
-      trans_src == Transaction::src_t::CLEANER_RECLAIM) {
+  if (is_cleaner_transaction(trans_src)) {
     // CLEANER transaction won't contain any onode tree operations
     assert(t.onode_tree_stats.is_clear());
+    assert(t.omap_tree_stats.is_clear());
   } else {
     if (t.onode_tree_stats.depth) {
       stats.onode_tree_depth = t.onode_tree_stats.depth;
     }
     get_by_src(stats.committed_onode_tree_efforts, trans_src
         ).increment(t.onode_tree_stats);
+    get_by_src(stats.committed_omap_tree_efforts, trans_src
+        ).increment(t.omap_tree_stats);
   }
 
   if (t.lba_tree_stats.depth) {
@@ -1192,6 +1264,11 @@ record_t Cache::prepare_record(
   }
   get_by_src(stats.committed_lba_tree_efforts, trans_src
       ).increment(t.lba_tree_stats);
+  if (t.backref_tree_stats.depth) {
+    stats.backref_tree_depth = t.backref_tree_stats.depth;
+  }
+  get_by_src(stats.committed_backref_tree_efforts, trans_src
+      ).increment(t.backref_tree_stats);
 
   ++(efforts.num_trans);
   efforts.num_ool_records += ool_stats.num_records;
@@ -1199,6 +1276,15 @@ record_t Cache::prepare_record(
   efforts.ool_record_data_bytes += ool_stats.get_data_bytes();
   efforts.inline_record_metadata_bytes +=
     (record.size.get_raw_mdlength() - record.get_delta_size());
+
+  auto &rewrite_version_stats = t.get_rewrite_version_stats();
+  if (trans_src == Transaction::src_t::CLEANER_TRIM) {
+    stats.committed_dirty_version.increment_stat(rewrite_version_stats);
+  } else if (trans_src == Transaction::src_t::CLEANER_RECLAIM) {
+    stats.committed_reclaim_version.increment_stat(rewrite_version_stats);
+  } else {
+    assert(rewrite_version_stats.is_clear());
+  }
 
   return record;
 }
@@ -1257,8 +1343,6 @@ void Cache::complete_commit(
   SUBTRACET(seastore_t, "final_block_start={}, seq={}",
             t, final_block_start, seq);
 
-  may_roll_backref_buffer(final_block_start);
-
   std::vector<backref_buf_entry_ref> backref_list;
   t.for_each_fresh_block([&](const CachedExtentRef &i) {
     bool is_inline = false;
@@ -1281,7 +1365,7 @@ void Cache::complete_commit(
 	  (t.get_src() == Transaction::src_t::MUTATE)
 	    ? i->last_modified
 	    : seastar::lowres_system_clock::time_point(),
-	  (t.get_src() >= Transaction::src_t::CLEANER_TRIM)
+	  (is_cleaner_transaction(t.get_src()))
 	    ? i->last_rewritten
 	    : seastar::lowres_system_clock::time_point());
       }
@@ -1412,7 +1496,6 @@ Cache::close_ertr::future<> Cache::close()
     dirty.erase(i++);
     intrusive_ptr_release(ptr);
   }
-  backref_bufs_to_flush.clear();
   backref_extents.clear();
   backref_buffer.reset();
   assert(stats.dirty_bytes == 0);
@@ -1448,7 +1531,6 @@ Cache::replay_delta(
 	journal_seq, alloc_replay_from, delta);
       return replay_delta_ertr::now();
     }
-    may_roll_backref_buffer(journal_seq.offset);
     alloc_delta_t alloc_delta;
     decode(alloc_delta, delta.bl);
     std::vector<backref_buf_entry_ref> backref_list;

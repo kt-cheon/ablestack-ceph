@@ -131,7 +131,7 @@ seastar::future<bufferlist> TMDriver::read(
 
 void TMDriver::init()
 {
-  tm = make_transaction_manager(false /* detailed */);
+  tm = make_transaction_manager(tm_make_config_t::get_default());
   tm->add_device(device.get(), true);
 }
 
