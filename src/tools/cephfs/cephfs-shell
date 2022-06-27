@@ -16,10 +16,19 @@ import shlex
 import stat
 import errno
 
+from distutils.version import LooseVersion
+
 from cmd2 import Cmd
 from cmd2 import __version__ as cmd2_version
-from cmd2.exceptions import Cmd2ArgparseError
-from distutils.version import LooseVersion
+# XXX: In cmd2 versions < 1.0.1, we'll get SystemExit(2) instead of
+# Cmd2ArgparseError
+if LooseVersion(cmd2_version) >= LooseVersion("1.0.1"):
+    from cmd2.exceptions import Cmd2ArgparseError
+else:
+    # HACK: so that we don't have check for version everywhere
+    # Cmd2ArgparseError is used.
+    class Cmd2ArgparseError:
+        pass
 
 if sys.version_info.major < 3:
     raise RuntimeError("cephfs-shell is only compatible with python3")
@@ -80,7 +89,8 @@ exit_codes = {'Misc': 1,
               errno.ECONNABORTED: 19,
               errno.ECONNREFUSED: 20,
               errno.ECONNRESET: 21,
-              errno.EINTR: 22}
+              errno.EINTR: 22,
+              errno.EISDIR: 23}
 
 
 #########################################################################
@@ -471,10 +481,15 @@ class CephFSShell(Cmd):
             if isinstance(e, Cmd2ArgparseError):
                 # NOTE: In case of Cmd2ArgparseError the error message is
                 # already printed beforehand (plus Cmd2ArgparseError
-                # instances have empty message)
-                pass
+                # instances have empty error message), so let's just set the
+                # exit code.
+                set_exit_code_msg(msg=None)
             else:
                 set_exit_code_msg(msg=f'{type(e).__name__}: {e}')
+        # In cmd2 versions < 1.1.0 we'll get SystemExit(2) instead of
+        # Cmd2ArgparseError
+        except SystemExit:
+            raise
 
     class path_to_bytes(argparse.Action):
         def __call__(self, parser, namespace, values, option_string=None):
@@ -869,14 +884,14 @@ class CephFSShell(Cmd):
         """
         return self.complete_filenames(text, line, begidx, endidx)
 
-    rmdir_parser = argparse.ArgumentParser(description='Remove Directory.')
-    rmdir_parser.add_argument('paths', help='Directory Path.', nargs='+',
+    rmdir_parser = argparse.ArgumentParser(
+        description='Remove the directory(ies), if they are empty.')
+    rmdir_parser.add_argument('paths', help='Directory Path(s)', nargs='+',
                               action=path_to_bytes)
     rmdir_parser.add_argument('-p', '--parent', action='store_true',
-                              help='Remove parent directories as necessary. '
-                                   'When this option is specified, no error '
-                                    'is reported if a directory has any '
-                                    'sub-directories, files')
+                              help="remove directory and its ancestors; "
+                                   "e.g., 'rmdir -p a/b/c' is similar to "
+                                   "'rmdir a/b/c a/b a'")
 
     @with_argparser(rmdir_parser)
     def do_rmdir(self, args):
@@ -926,7 +941,23 @@ class CephFSShell(Cmd):
                 try:
                     cephfs.rmdir(path)
                 except libcephfs.Error as e:
-                    set_exit_code_msg(msg=e)
+                    if e.get_error_code() == 2:
+                        set_exit_code_msg(e.get_error_code(),
+                                          "rmdir: failed to remove "
+                                          f"{path.decode('utf-8')}: "
+                                          "No such file or directory")
+                    elif e.get_error_code() == 20:
+                        set_exit_code_msg(e.get_error_code(),
+                                          "rmdir: failed to remove "
+                                          f"{path.decode('utf-8')}: "
+                                          "Not a directory")
+                    elif e.get_error_code() == 39:
+                        set_exit_code_msg(e.get_error_code(),
+                                          "rmdir: failed to remove "
+                                          f"{path.decode('utf-8')}: "
+                                          "Directory not empty")
+                    else:
+                        set_exit_code_msg(msg=e)
 
     def complete_rm(self, text, line, begidx, endidx):
         """
@@ -953,7 +984,18 @@ class CephFSShell(Cmd):
                     cephfs.unlink(path)
                 except libcephfs.Error as e:
                     # NOTE: perhaps we need a better msg here
-                    set_exit_code_msg(msg=e)
+                    if e.get_error_code() == 2:
+                        set_exit_code_msg(e.get_error_code(),
+                                          "rm: failed to remove "
+                                          f"{path.decode('utf-8')}: "
+                                          "No such file or directory")
+                    elif e.get_error_code() == 21:
+                        set_exit_code_msg(e.get_error_code(),
+                                          "rm: failed to remove "
+                                          f"{path.decode('utf-8')}: "
+                                          "Is a directory")
+                    else:
+                        set_exit_code_msg(msg=e)
 
     def complete_mv(self, text, line, begidx, endidx):
         """
