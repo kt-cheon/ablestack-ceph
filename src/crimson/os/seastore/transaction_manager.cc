@@ -128,13 +128,19 @@ TransactionManager::mount_ertr::future<> TransactionManager::mount()
 		       *segment_cleaner->get_empty_space_tracker()));
 	      return backref_manager->scan_mapped_space(
 		t,
-		[this, FNAME, &t](paddr_t addr, extent_len_t len, depth_t depth) {
+		[this, FNAME, &t](
+		  paddr_t addr,
+		  extent_len_t len,
+		  depth_t depth,
+		  extent_types_t type)
+		{
 		  TRACET(
 		    "marking {}~{} used",
 		    t,
 		    addr,
 		    len);
-		  if (addr.is_real()) {
+		  if (addr.is_real() &&
+		      !backref_manager->backref_should_be_removed(addr)) {
 		    segment_cleaner->mark_space_used(
 		      addr,
 		      len ,
@@ -142,18 +148,19 @@ TransactionManager::mount_ertr::future<> TransactionManager::mount()
 		      seastar::lowres_system_clock::time_point(),
 		      /* init_scan = */ true);
 		  }
-		  if (depth) {
-		    if (depth > 1) {
-		      cache->add_backref_extent(
-			addr, extent_types_t::BACKREF_INTERNAL);
-		    } else {
-		      cache->add_backref_extent(
-			addr, extent_types_t::BACKREF_LEAF);
-		    }
+		  if (is_backref_node(type)) {
+		    ceph_assert(depth);
+		    backref_manager->cache_new_backref_extent(addr, type);
+		    cache->update_tree_extents_num(type, 1);
+		    return seastar::now();
+		  } else {
+		    ceph_assert(!depth);
+		    cache->update_tree_extents_num(type, 1);
+		    return seastar::now();
 		  }
 		}).si_then([this] {
 		  LOG_PREFIX(TransactionManager::mount);
-		  auto &backrefs = cache->get_backrefs();
+		  auto &backrefs = backref_manager->get_cached_backrefs();
 		  DEBUG("marking {} backrefs used", backrefs.size());
 		  for (auto &backref : backrefs) {
 		    segment_cleaner->mark_space_used(
@@ -162,14 +169,7 @@ TransactionManager::mount_ertr::future<> TransactionManager::mount()
 		      seastar::lowres_system_clock::time_point(),
 		      seastar::lowres_system_clock::time_point(),
 		      true);
-		  }
-		  auto &del_backrefs = cache->get_del_backrefs();
-		  DEBUG("marking {} backrefs free", del_backrefs.size());
-		  for (auto &del_backref : del_backrefs) {
-		    segment_cleaner->mark_space_free(
-		      del_backref.paddr,
-		      del_backref.len,
-		      true);
+		    cache->update_tree_extents_num(backref.type, 1);
 		  }
 		  return seastar::now();
 		});
@@ -362,6 +362,9 @@ TransactionManager::submit_transaction_direct(
     return tref.get_handle().enter(write_pipeline.prepare);
   }).si_then([this, FNAME, &tref, seq_to_trim=std::move(seq_to_trim)]() mutable
 	      -> submit_transaction_iertr::future<> {
+    if (seq_to_trim && *seq_to_trim != JOURNAL_SEQ_NULL) {
+      cache->trim_backref_bufs(*seq_to_trim);
+    }
     auto record = cache->prepare_record(tref, segment_cleaner.get());
 
     tref.get_handle().maybe_release_collection_lock();
@@ -372,9 +375,6 @@ TransactionManager::submit_transaction_direct(
       (auto submit_result) mutable {
       SUBDEBUGT(seastore_t, "committed with {}", tref, submit_result);
       auto start_seq = submit_result.write_result.start_seq;
-      if (seq_to_trim && *seq_to_trim != JOURNAL_SEQ_NULL) {
-	cache->trim_backref_bufs(*seq_to_trim);
-      }
       cache->complete_commit(
           tref,
           submit_result.record_block_base,
@@ -482,7 +482,7 @@ TransactionManager::rewrite_logical_extent(
   nlextent->set_pin(lextent->get_pin().duplicate());
   nlextent->last_modified = lextent->last_modified;
 
-  DEBUGT("rewriting extent -- {} to {}", t, *lextent, *nlextent);
+  DEBUGT("rewriting logical extent -- {} to {}", t, *lextent, *nlextent);
 
   /* This update_mapping is, strictly speaking, unnecessary for delayed_alloc
    * extents since we're going to do it again once we either do the ool write
@@ -501,11 +501,6 @@ TransactionManager::rewrite_extent_ret TransactionManager::rewrite_extent(
 {
   LOG_PREFIX(TransactionManager::rewrite_extent);
 
-  if (is_backref_node(extent->get_type())) {
-    t.get_rewrite_version_stats().increment(extent->get_version());
-    return backref_manager->rewrite_extent(t, extent);
-  }
-
   {
     auto updated = cache->update_extent_from_transaction(t, extent);
     if (!updated) {
@@ -513,12 +508,18 @@ TransactionManager::rewrite_extent_ret TransactionManager::rewrite_extent(
       return rewrite_extent_iertr::now();
     }
     extent = updated;
+    ceph_assert(!extent->is_pending_io());
   }
 
   t.get_rewrite_version_stats().increment(extent->get_version());
 
+  if (is_backref_node(extent->get_type())) {
+    DEBUGT("rewriting backref extent -- {}", t, *extent);
+    return backref_manager->rewrite_extent(t, extent);
+  }
+
   if (extent->get_type() == extent_types_t::ROOT) {
-    DEBUGT("marking root for rewrite -- {}", t, *extent);
+    DEBUGT("rewriting root extent -- {}", t, *extent);
     cache->duplicate_for_write(t, extent);
     return rewrite_extent_iertr::now();
   }
@@ -658,7 +659,6 @@ TransactionManagerRef make_transaction_manager(tm_make_config_t config)
     cleaner_config,
     std::move(sms),
     *backref_manager,
-    *cache,
     cleaner_is_detailed);
 
   JournalRef journal;

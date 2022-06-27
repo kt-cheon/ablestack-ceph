@@ -360,6 +360,10 @@ struct transaction_manager_test_t :
     return { create_mutate_transaction(), {} };
   }
 
+  test_transaction_t create_read_test_transaction() {
+    return {create_read_transaction(), {} };
+  }
+
   test_transaction_t create_weak_test_transaction() {
     return { create_weak_transaction(), {} };
   }
@@ -398,8 +402,9 @@ struct transaction_manager_test_t :
       [this, &tracker](auto &t) {
 	return backref_manager->scan_mapped_space(
 	  t,
-	  [&tracker](auto offset, auto len, depth_t) {
-	    if (offset.get_addr_type() == addr_types_t::SEGMENT) {
+	  [&tracker, this](auto offset, auto len, depth_t, extent_types_t) {
+	    if (offset.get_addr_type() == addr_types_t::SEGMENT &&
+		!backref_manager->backref_should_be_removed(offset)) {
 	      logger().debug("check_usage: tracker alloc {}~{}",
 		offset, len);
 	      tracker->allocate(
@@ -408,7 +413,7 @@ struct transaction_manager_test_t :
 		len);
 	    }
 	  }).si_then([&tracker, this] {
-	    auto &backrefs = cache->get_backrefs();
+	    auto &backrefs = backref_manager->get_cached_backrefs();
 	    for (auto &backref : backrefs) {
 	      if (backref.paddr.get_addr_type() == addr_types_t::SEGMENT) {
 		logger().debug("check_usage: by backref, tracker alloc {}~{}",
@@ -417,17 +422,6 @@ struct transaction_manager_test_t :
 		  backref.paddr.as_seg_paddr().get_segment_id(),
 		  backref.paddr.as_seg_paddr().get_segment_off(),
 		  backref.len);
-	      }
-	    }
-	    auto &del_backrefs = cache->get_del_backrefs();
-	    for (auto &del_backref : del_backrefs) {
-	      if (del_backref.paddr.get_addr_type() == addr_types_t::SEGMENT) {
-		logger().debug("check_usage: by backref, tracker release {}~{}",
-		  del_backref.paddr, del_backref.len);
-		tracker->release(
-		  del_backref.paddr.as_seg_paddr().get_segment_id(),
-		  del_backref.paddr.as_seg_paddr().get_segment_off(),
-		  del_backref.len);
 	      }
 	    }
 	    return seastar::now();
@@ -640,6 +634,39 @@ struct transaction_manager_test_t :
 	"Invalid error in SeaStore::list_collections"
       }
     );
+  }
+
+  void test_parallel_extent_read() {
+    constexpr size_t TOTAL = 4<<20;
+    constexpr size_t BSIZE = 4<<10;
+    constexpr size_t BLOCKS = TOTAL / BSIZE;
+    run_async([this] {
+      for (unsigned i = 0; i < BLOCKS; ++i) {
+	auto t = create_transaction();
+	auto extent = alloc_extent(
+	  t,
+	  i * BSIZE,
+	  BSIZE);
+	ASSERT_EQ(i * BSIZE, extent->get_laddr());
+	submit_transaction(std::move(t));
+      }
+
+      seastar::do_with(
+	create_read_test_transaction(),
+	[this](auto &t) {
+	return with_trans_intr(*(t.t), [this](auto &t) {
+	  return trans_intr::parallel_for_each(
+	    boost::make_counting_iterator(0lu),
+	    boost::make_counting_iterator(BLOCKS),
+	    [this, &t](auto i) {
+	    return tm->read_extent<TestBlock>(t, i * BSIZE, BSIZE
+	    ).si_then([](auto) {
+	      return seastar::now();
+	    });
+	  });
+	});
+      }).unsafe_get0();
+    });
   }
 
   void test_random_writes_concurrent() {
@@ -1070,6 +1097,11 @@ TEST_P(tm_single_device_test_t, random_writes_concurrent)
 TEST_P(tm_multi_device_test_t, random_writes_concurrent)
 {
   test_random_writes_concurrent();
+}
+
+TEST_P(tm_single_device_test_t, parallel_extent_read)
+{
+  test_parallel_extent_read();
 }
 
 INSTANTIATE_TEST_SUITE_P(

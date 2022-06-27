@@ -273,18 +273,18 @@ int process_request(rgw::sal::Store* const store,
                     string* user,
                     ceph::coarse_real_clock::duration* latency,
                     std::shared_ptr<RateLimiter> ratelimit,
-                    int* http_ret)
+                    int* http_ret,
+                    rgw::lua::Background* lua_background)
 {
   int ret = client_io->init(g_ceph_context);
-
   dout(1) << "====== starting new request req=" << hex << req << dec
 	  << " =====" << dendl;
   perfcounter->inc(l_rgw_req);
 
   RGWEnv& rgw_env = client_io->get_env();
 
-  struct req_state rstate(g_ceph_context, &rgw_env, req->id);
-  struct req_state *s = &rstate;
+  req_state rstate(g_ceph_context, &rgw_env, req->id);
+  req_state *s = &rstate;
 
   s->ratelimit_data = ratelimit;
   std::unique_ptr<rgw::sal::User> u = store->get_user(rgw_user());
@@ -336,7 +336,7 @@ int process_request(rgw::sal::Store* const store,
     } else if (rc < 0) {
       ldpp_dout(op, 5) << "WARNING: failed to read pre request script. error: " << rc << dendl;
     } else {
-      rc = rgw::lua::request::execute(store, rest, olog, s, op->name(), script);
+      rc = rgw::lua::request::execute(store, rest, olog, s, op->name(), script, lua_background);
       if (rc < 0) {
         ldpp_dout(op, 5) << "WARNING: failed to execute pre request script. error: " << rc << dendl;
       }
@@ -401,7 +401,7 @@ int process_request(rgw::sal::Store* const store,
   }
 
 done:
-  if (op) {
+  if (op && s->trace) {
     s->trace->SetAttribute(tracing::rgw::RETURN, op->get_ret());
     if (s->user) {
       s->trace->SetAttribute(tracing::rgw::USER_ID, s->user->get_id().id);
@@ -419,7 +419,7 @@ done:
     } else if (rc < 0) {
       ldpp_dout(op, 5) << "WARNING: failed to read post request script. error: " << rc << dendl;
     } else {
-      rc = rgw::lua::request::execute(store, rest, olog, s, op->name(), script);
+      rc = rgw::lua::request::execute(store, rest, olog, s, op->name(), script, lua_background);
       if (rc < 0) {
         ldpp_dout(op, 5) << "WARNING: failed to execute post request script. error: " << rc << dendl;
       }

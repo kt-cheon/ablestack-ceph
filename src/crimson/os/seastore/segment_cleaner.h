@@ -479,13 +479,15 @@ public:
     /// Number of maximum journal segments to block user transactions.
     size_t max_journal_segments = 0;
 
+    /// Number of journal segments the transactions in which can
+    /// have their corresponding backrefs unmerged
+    size_t target_backref_inflight_segments = 0;
+
     /// Ratio of maximum available space to disable reclaiming.
     double available_ratio_gc_max = 0;
     /// Ratio of minimum available space to force reclaiming.
     double available_ratio_hard_limit = 0;
 
-    /// Ratio of maximum reclaimable space to block user transactions.
-    double reclaim_ratio_hard_limit = 0;
     /// Ratio of minimum reclaimable space to stop reclaiming.
     double reclaim_ratio_gc_threshold = 0;
 
@@ -501,7 +503,6 @@ public:
     void validate() const {
       ceph_assert(max_journal_segments > target_journal_segments);
       ceph_assert(available_ratio_gc_max > available_ratio_hard_limit);
-      ceph_assert(reclaim_ratio_hard_limit > reclaim_ratio_gc_threshold);
       ceph_assert(reclaim_bytes_per_cycle > 0);
       ceph_assert(rewrite_dirty_bytes_per_cycle > 0);
       ceph_assert(rewrite_backref_bytes_per_cycle > 0);
@@ -511,10 +512,10 @@ public:
       return config_t{
 	  12,   // target_journal_segments
 	  16,   // max_journal_segments
-	  .9,   // available_ratio_gc_max
-	  .2,   // available_ratio_hard_limit
-	  .8,   // reclaim_ratio_hard_limit
-	  .6,   // reclaim_ratio_gc_threshold
+	  2,	// target_backref_inflight_segments
+	  .1,   // available_ratio_gc_max
+	  .05,  // available_ratio_hard_limit
+	  .1,   // reclaim_ratio_gc_threshold
 	  1<<20,// reclaim_bytes_per_cycle
 	  1<<17,// rewrite_dirty_bytes_per_cycle
 	  1<<24 // rewrite_backref_bytes_per_cycle
@@ -525,9 +526,9 @@ public:
       return config_t{
 	  2,    // target_journal_segments
 	  4,    // max_journal_segments
-	  .9,   // available_ratio_gc_max
+	  2,	// target_backref_inflight_segments
+	  .99,  // available_ratio_gc_max
 	  .2,   // available_ratio_hard_limit
-	  .8,   // reclaim_ratio_hard_limit
 	  .6,   // reclaim_ratio_gc_threshold
 	  1<<20,// reclaim_bytes_per_cycle
 	  1<<17,// rewrite_dirty_bytes_per_cycle
@@ -639,7 +640,6 @@ private:
 
   SegmentManagerGroupRef sm_group;
   BackrefManager &backref_manager;
-  Cache &cache;
 
   SpaceTrackerIRef space_tracker;
   segments_info_t segments;
@@ -716,7 +716,6 @@ public:
     config_t config,
     SegmentManagerGroupRef&& sm_group,
     BackrefManager &backref_manager,
-    Cache &cache,
     bool detailed = false);
 
   SegmentSeqAllocator& get_ool_segment_seq_allocator() {
@@ -797,8 +796,7 @@ public:
 
   void mark_space_free(
     paddr_t addr,
-    extent_len_t len,
-    bool force = false);
+    extent_len_t len);
 
   SpaceTrackerIRef get_empty_space_tracker() const {
     return space_tracker->make_empty();
@@ -881,7 +879,7 @@ private:
     return (1 - util) * age / (1 + util);
   }
 
-  journal_seq_t get_next_gc_target() const;
+  segment_id_t get_next_reclaim_segment() const;
 
   /**
    * rewrite_dirty
@@ -924,13 +922,52 @@ private:
     return ret;
   }
 
-  // GC status helpers
-  std::optional<paddr_t> next_reclaim_pos;
-
-  bool final_reclaim() {
-    return next_reclaim_pos->as_seg_paddr().get_segment_off()
-      + config.reclaim_bytes_per_cycle >= (size_t)segments.get_segment_size();
+  journal_seq_t get_backref_tail() const {
+    auto ret = segments.get_journal_head();
+    ceph_assert(ret != JOURNAL_SEQ_NULL);
+    if (ret.segment_seq >= config.target_backref_inflight_segments) {
+      ret.segment_seq -= config.target_backref_inflight_segments;
+    } else {
+      ret.segment_seq = 0;
+      ret.offset = P_ADDR_MIN;
+    }
+    return ret;
   }
+
+  struct reclaim_state_t {
+    std::size_t segment_size;
+    paddr_t start_pos;
+    paddr_t end_pos;
+
+    static reclaim_state_t create(
+        segment_id_t segment_id,
+        std::size_t segment_size) {
+      return {segment_size,
+              P_ADDR_NULL,
+              paddr_t::make_seg_paddr(segment_id, 0)};
+    }
+
+    segment_id_t get_segment_id() const {
+      return end_pos.as_seg_paddr().get_segment_id();
+    }
+
+    bool is_complete() const {
+      return (std::size_t)end_pos.as_seg_paddr().get_segment_off() >= segment_size;
+    }
+
+    void advance(std::size_t bytes) {
+      assert(!is_complete());
+      start_pos = end_pos;
+      auto &end_seg_paddr = end_pos.as_seg_paddr();
+      auto next_off = end_seg_paddr.get_segment_off() + bytes;
+      if (next_off > segment_size) {
+        end_seg_paddr.set_segment_off(segment_size);
+      } else {
+        end_seg_paddr.set_segment_off(next_off);
+      }
+    }
+  };
+  std::optional<reclaim_state_t> reclaim_state;
 
   /**
    * GCProcess
@@ -1023,19 +1060,14 @@ private:
   using gc_trim_journal_ret = gc_trim_journal_ertr::future<>;
   gc_trim_journal_ret gc_trim_journal();
 
+  using gc_trim_backref_ertr = gc_ertr;
+  using gc_trim_backref_ret = gc_trim_backref_ertr::future<journal_seq_t>;
+  gc_trim_backref_ret gc_trim_backref(journal_seq_t limit);
+
   using gc_reclaim_space_ertr = gc_ertr;
   using gc_reclaim_space_ret = gc_reclaim_space_ertr::future<>;
   gc_reclaim_space_ret gc_reclaim_space();
 
-  using retrieve_backref_extents_iertr = work_iertr;
-  using retrieve_backref_extents_ret =
-    retrieve_backref_extents_iertr::future<>;
-  retrieve_backref_extents_ret _retrieve_backref_extents(
-    Transaction &t,
-    std::set<
-      Cache::backref_extent_buf_entry_t,
-      Cache::backref_extent_buf_entry_t::cmp_t> &&backref_extents,
-    std::vector<CachedExtentRef> &extents);
 
   using retrieve_live_extents_iertr = work_iertr;
   using retrieve_live_extents_ret =
@@ -1046,6 +1078,13 @@ private:
       backref_buf_entry_t,
       backref_buf_entry_t::cmp_t> &&backrefs,
     std::vector<CachedExtentRef> &extents);
+
+  using retrieve_backref_mappings_ertr = work_ertr;
+  using retrieve_backref_mappings_ret =
+    retrieve_backref_mappings_ertr::future<backref_pin_list_t>;
+  retrieve_backref_mappings_ret retrieve_backref_mappings(
+    paddr_t start_paddr,
+    paddr_t end_paddr);
 
   /*
    * Segments calculations
@@ -1160,12 +1199,7 @@ private:
       return false;
     }
     auto aratio = get_projected_available_ratio();
-    auto rratio = get_reclaim_ratio();
-    return (
-      (aratio < config.available_ratio_hard_limit) ||
-      ((aratio < config.available_ratio_gc_max) &&
-       (rratio > config.reclaim_ratio_hard_limit))
-    );
+    return aratio < config.available_ratio_hard_limit;
   }
 
   bool should_block_on_gc() const {
@@ -1227,6 +1261,9 @@ private:
     return get_dirty_tail() > journal_tail_target;
   }
 
+  bool gc_should_trim_backref() const {
+    return get_backref_tail() > alloc_info_replay_from;
+  }
   /**
    * gc_should_run
    *
@@ -1235,7 +1272,9 @@ private:
   bool gc_should_run() const {
     if (disable_trim) return false;
     ceph_assert(init_complete);
-    return gc_should_reclaim_space() || gc_should_trim_journal();
+    return gc_should_reclaim_space()
+      || gc_should_trim_journal()
+      || gc_should_trim_backref();
   }
 
   void init_mark_segment_closed(

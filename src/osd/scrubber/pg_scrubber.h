@@ -459,6 +459,9 @@ class PgScrubber : public ScrubPgIF,
   void select_range_n_notify() final;
 
   Scrub::BlockedRangeWarning acquire_blocked_alarm() final;
+  void set_scrub_blocked(utime_t since) final;
+  void clear_scrub_blocked() final;
+
 
   /// walk the log to find the latest update that affects our chunk
   eversion_t search_log_for_updates() const final;
@@ -524,6 +527,7 @@ class PgScrubber : public ScrubPgIF,
   [[nodiscard]] bool was_epoch_changed() const final;
 
   void set_queued_or_active() final;
+  /// Clears `m_queued_or_active` and restarts snaptrimming
   void clear_queued_or_active() final;
 
   void mark_local_map_ready() final;

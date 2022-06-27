@@ -42,11 +42,7 @@
 %bcond_without system_pmdk
 %endif
 %bcond_without selinux
-%if 0%{?rhel} >= 8
-%bcond_with cephfs_java
-%else
 %bcond_without cephfs_java
-%endif
 %bcond_without amqp_endpoint
 %bcond_without kafka_endpoint
 %bcond_without lttng
@@ -90,7 +86,11 @@
 %endif
 %endif
 %bcond_with seastar
+%if 0%{?suse_version}
 %bcond_with jaeger
+%else
+%bcond_without jaeger
+%endif
 %if 0%{?fedora} || 0%{?suse_version} >= 1500
 # distros that ship cmd2 and/or colorama
 %bcond_without cephfs_shell
@@ -187,6 +187,7 @@ Requires:       ceph-mon = %{_epoch_prefix}%{version}-%{release}
 Requires(post):	binutils
 %if 0%{with cephfs_java}
 BuildRequires:	java-devel
+BuildRequires:	jpackage-utils
 BuildRequires:	sharutils
 %endif
 %if 0%{with selinux}
@@ -1311,6 +1312,8 @@ cmake .. \
     -DWITH_TESTS:BOOL=OFF \
 %endif
 %if 0%{with cephfs_java}
+    -DJAVA_HOME=%{java_home} \
+    -DJAVA_LIB_INSTALL_DIR=%{_jnidir} \
     -DWITH_CEPHFS_JAVA:BOOL=ON \
 %endif
 %if 0%{with selinux}
@@ -1363,8 +1366,8 @@ cmake .. \
 %if 0%{with system_pmdk}
     -DWITH_SYSTEM_PMDK:BOOL=ON \
 %endif
-%if 0%{with jaeger}
-    -DWITH_JAEGER:BOOL=ON \
+%if 0%{without jaeger}
+    -DWITH_JAEGER:BOOL=OFF \
 %endif
 %if 0%{?suse_version}
     -DBOOST_J:STRING=%{jobs} \
@@ -1586,8 +1589,7 @@ exit 0
 
 %if ! 0%{?suse_version}
 %postun -n cephadm
-userdel -r cephadm || true
-exit 0
+[ $1 -ne 0 ] || userdel cephadm || :
 %endif
 
 %files -n cephadm
@@ -2357,6 +2359,7 @@ fi
 %dir %{_includedir}/cephfs
 %{_includedir}/cephfs/libcephfs.h
 %{_includedir}/cephfs/ceph_ll_client.h
+%{_includedir}/cephfs/types.h
 %dir %{_includedir}/cephfs/metrics
 %{_includedir}/cephfs/metrics/Types.h
 %{_libdir}/libcephfs.so

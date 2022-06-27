@@ -44,8 +44,8 @@ from pathlib import Path
 FuncT = TypeVar('FuncT', bound=Callable)
 
 # Default container images -----------------------------------------------------
-DEFAULT_IMAGE = 'quay.ceph.io/ceph-ci/ceph:master'
-DEFAULT_IMAGE_IS_MASTER = True
+DEFAULT_IMAGE = 'quay.ceph.io/ceph-ci/ceph:main'
+DEFAULT_IMAGE_IS_MAIN = True
 DEFAULT_IMAGE_RELEASE = 'quincy'
 DEFAULT_PROMETHEUS_IMAGE = 'quay.io/prometheus/prometheus:v2.33.4'
 DEFAULT_LOKI_IMAGE = 'docker.io/grafana/loki:2.4.0'
@@ -53,8 +53,8 @@ DEFAULT_PROMTAIL_IMAGE = 'docker.io/grafana/promtail:2.4.0'
 DEFAULT_NODE_EXPORTER_IMAGE = 'quay.io/prometheus/node-exporter:v1.3.1'
 DEFAULT_ALERT_MANAGER_IMAGE = 'quay.io/prometheus/alertmanager:v0.23.0'
 DEFAULT_GRAFANA_IMAGE = 'quay.io/ceph/ceph-grafana:8.3.5'
-DEFAULT_HAPROXY_IMAGE = 'docker.io/library/haproxy:2.3'
-DEFAULT_KEEPALIVED_IMAGE = 'docker.io/arcts/keepalived'
+DEFAULT_HAPROXY_IMAGE = 'quay.io/ceph/haproxy:2.3'
+DEFAULT_KEEPALIVED_IMAGE = 'quay.io/ceph/keepalived:2.1.5'
 DEFAULT_SNMP_GATEWAY_IMAGE = 'docker.io/maxwo/snmp-notifier:v1.2.1'
 DEFAULT_REGISTRY = 'docker.io'   # normalize unqualified digests to this
 # ------------------------------------------------------------------------------
@@ -903,13 +903,12 @@ class CephIscsi(object):
 
     def get_tcmu_runner_container(self):
         # type: () -> CephContainer
-        tcmu_container = get_container(self.ctx, self.fsid, self.daemon_type, self.daemon_id)
+        # daemon_id, is used to generated the cid and pid files used by podman but as both tcmu-runner
+        # and rbd-target-api have the same daemon_id, it conflits and prevent the second container from
+        # starting. .tcmu runner is appened to the daemon_id to fix that.
+        tcmu_container = get_container(self.ctx, self.fsid, self.daemon_type, str(self.daemon_id) + '.tcmu')
         tcmu_container.entrypoint = '/usr/bin/tcmu-runner'
         tcmu_container.cname = self.get_container_name(desc='tcmu')
-        # remove extra container args for tcmu container.
-        # extra args could cause issue with forking service type
-        tcmu_container.container_args = []
-        set_pids_limit_unlimited(self.ctx, tcmu_container.container_args)
         return tcmu_container
 
 ##################################
@@ -2038,7 +2037,7 @@ def infer_config(func: FuncT) -> FuncT:
 
 
 def _get_default_image(ctx: CephadmContext) -> str:
-    if DEFAULT_IMAGE_IS_MASTER:
+    if DEFAULT_IMAGE_IS_MAIN:
         warn = """This is a development version of cephadm.
 For information regarding the latest stable release:
     https://docs.ceph.com/docs/{}/cephadm/install
@@ -2868,6 +2867,10 @@ def get_container_mounts(ctx, fsid, daemon_type, daemon_id,
     if daemon_type == CephIscsi.daemon_type:
         assert daemon_id
         data_dir = get_data_dir(fsid, ctx.data_dir, daemon_type, daemon_id)
+        # Removes ending ".tcmu" from data_dir a tcmu-runner uses the same data_dir
+        # as rbd-runner-api
+        if data_dir.endswith('.tcmu'):
+            data_dir = re.sub(r'\.tcmu$', '', data_dir)
         log_dir = get_log_dir(fsid, ctx.log_dir)
         mounts.update(CephIscsi.get_container_mounts(data_dir, log_dir))
 
@@ -3304,16 +3307,6 @@ def deploy_daemon_units(
                     bind_mounts=get_container_binds(ctx, fsid, daemon_type, daemon_id),
                     cname='ceph-%s-%s.%s-activate' % (fsid, daemon_type, daemon_id),
                 )
-                if 'cluster' in ctx and ctx.cluster:
-                    # ctx.cluster is only set during adoption of a daemon from a cluster
-                    # with a custom name (not "ceph"). The initial activate command the first
-                    # time we start the new cephadm based systemd unit for this osd must account
-                    # for this by mounting to the correct data dir in the container. Otherwise
-                    # necessary files from the old data dir of the daemon won't be copied over
-                    # to the new data dir on the host. After the first start (e.g. on any redeploys)
-                    # this is no longer necessary as we will have these files in the data dir on the host
-                    if data_dir in prestart.volume_mounts:
-                        prestart.volume_mounts[data_dir] = f'/var/lib/ceph/osd/{ctx.cluster}-{daemon_id}'
                 _write_container_cmd_to_bash(ctx, f, prestart, 'LVM OSDs use ceph-volume lvm activate')
         elif daemon_type == CephIscsi.daemon_type:
             f.write(' '.join(CephIscsi.configfs_mount_umount(data_dir, mount=True)) + '\n')
@@ -3360,9 +3353,12 @@ def deploy_daemon_units(
             _write_container_cmd_to_bash(ctx, f, poststop, 'deactivate osd')
         elif daemon_type == CephIscsi.daemon_type:
             # make sure we also stop the tcmu container
+            runtime_dir = '/run'
             ceph_iscsi = CephIscsi.init(ctx, fsid, daemon_id)
             tcmu_container = ceph_iscsi.get_tcmu_runner_container()
             f.write('! ' + ' '.join(tcmu_container.stop_cmd()) + '\n')
+            f.write('! ' + 'rm ' + runtime_dir + '/ceph-%s@%s.%s.service-pid' % (fsid, daemon_type, str(daemon_id) + '.tcmu') + '\n')
+            f.write('! ' + 'rm ' + runtime_dir + '/ceph-%s@%s.%s.service-cid' % (fsid, daemon_type, str(daemon_id) + '.tcmu') + '\n')
             f.write(' '.join(CephIscsi.configfs_mount_umount(data_dir, mount=False)) + '\n')
         os.fchmod(f.fileno(), 0o600)
         os.rename(data_dir + '/unit.poststop.new',
@@ -3542,7 +3538,7 @@ def install_sysctl(ctx: CephadmContext, fsid: str, daemon_type: str) -> None:
             f.write('\n'.join(lines))
 
     conf = Path(ctx.sysctl_dir).joinpath(f'90-ceph-{fsid}-{daemon_type}.conf')
-    lines: Optional[List] = None
+    lines: List = []
 
     if daemon_type == 'osd':
         lines = OSD.get_sysctl_settings()
@@ -3550,12 +3546,42 @@ def install_sysctl(ctx: CephadmContext, fsid: str, daemon_type: str) -> None:
         lines = HAproxy.get_sysctl_settings()
     elif daemon_type == 'keepalived':
         lines = Keepalived.get_sysctl_settings()
+    lines = filter_sysctl_settings(ctx, lines)
 
     # apply the sysctl settings
     if lines:
         Path(ctx.sysctl_dir).mkdir(mode=0o755, exist_ok=True)
         _write(conf, lines)
         call_throws(ctx, ['sysctl', '--system'])
+
+
+def sysctl_get(ctx: CephadmContext, variable: str) -> Union[str, None]:
+    """
+    Read a sysctl setting by executing 'sysctl -b {variable}'
+    """
+    out, err, code = call(ctx, ['sysctl', '-b', variable])
+    return out or None
+
+
+def filter_sysctl_settings(ctx: CephadmContext, lines: List[str]) -> List[str]:
+    """
+    Given a list of sysctl settings, examine the system's current configuration
+    and return those which are not currently set as described.
+    """
+    def test_setting(desired_line: str) -> bool:
+        # Remove any comments
+        comment_start = desired_line.find('#')
+        if comment_start != -1:
+            desired_line = desired_line[:comment_start]
+        desired_line = desired_line.strip()
+        if not desired_line or desired_line.isspace():
+            return False
+        setting, desired_value = map(lambda s: s.strip(), desired_line.split('='))
+        if not setting or not desired_value:
+            return False
+        actual_value = sysctl_get(ctx, setting)
+        return desired_value != actual_value
+    return list(filter(test_setting, lines))
 
 
 def migrate_sysctl_dir(ctx: CephadmContext, fsid: str) -> None:
@@ -5601,7 +5627,7 @@ def command_bootstrap(ctx):
     logger.info('Please consider enabling telemetry to help improve Ceph:\n\n'
                 '\tceph telemetry on\n\n'
                 'For more information see:\n\n'
-                '\thttps://docs.ceph.com/docs/master/mgr/telemetry/\n')
+                '\thttps://docs.ceph.com/en/latest/mgr/telemetry/\n')
     logger.info('Bootstrap complete.')
     return 0
 
@@ -6585,6 +6611,37 @@ class AdoptOsd(object):
 
         return osd_fsid, osd_type
 
+    def change_cluster_name(self) -> None:
+        logger.info('Attempting to convert osd cluster name to ceph . . .')
+        c = get_ceph_volume_container(
+            self.ctx,
+            args=['lvm', 'list', '{}'.format(self.osd_id), '--format=json'],
+        )
+        out, err, code = call_throws(self.ctx, c.run_cmd())
+        if code:
+            raise Exception(f'Failed to get list of LVs: {err}\nceph-volume failed with rc {code}')
+        try:
+            js = json.loads(out)
+            if not js:
+                raise RuntimeError(f'Failed to find osd.{self.osd_id}')
+            device: Optional[Dict[Any, Any]] = None
+            for d in js[self.osd_id]:
+                if d['type'] == 'block':
+                    device = d
+                    break
+            if not device:
+                raise RuntimeError(f'Failed to find block device for osd.{self.osd_id}')
+            vg = device['vg_name']
+            out, err, code = call_throws(self.ctx, ['lvchange', '--deltag', f'ceph.cluster_name={self.ctx.cluster}', vg])
+            if code:
+                raise RuntimeError(f"Can't delete tag ceph.cluster_name={self.ctx.cluster} on osd.{self.osd_id}.\nlvchange failed with rc {code}")
+            out, err, code = call_throws(self.ctx, ['lvchange', '--addtag', 'ceph.cluster_name=ceph', vg])
+            if code:
+                raise RuntimeError(f"Can't add tag ceph.cluster_name=ceph on osd.{self.osd_id}.\nlvchange failed with rc {code}")
+            logger.info('Successfully converted osd cluster name')
+        except (Exception, RuntimeError) as e:
+            logger.info(f'Failed to convert osd cluster name: {e}')
+
 
 def command_adopt_ceph(ctx, daemon_type, daemon_id, fsid):
     # type: (CephadmContext, str, str, str) -> None
@@ -6610,6 +6667,8 @@ def command_adopt_ceph(ctx, daemon_type, daemon_id, fsid):
             osd_fsid, osd_type = adopt_osd.check_offline_simple_osd()
         if not osd_fsid:
             raise Error('Unable to find OSD {}'.format(daemon_id))
+        elif ctx.cluster != 'ceph':
+            adopt_osd.change_cluster_name()
         logger.info('objectstore_type is %s' % osd_type)
         assert osd_type
         if osd_type == 'filestore':
@@ -8475,6 +8534,24 @@ class HostFacts():
         # type: () -> str
         """Determine server BIOS date from  DMI data in sysfs"""
         return read_file(HostFacts._dmi_path_list, 'bios_date')
+
+    @property
+    def chassis_serial(self):
+        # type: () -> str
+        """Determine chassis serial number from DMI data in sysfs"""
+        return read_file(HostFacts._dmi_path_list, 'chassis_serial')
+
+    @property
+    def board_serial(self):
+        # type: () -> str
+        """Determine mainboard serial number from DMI data in sysfs"""
+        return read_file(HostFacts._dmi_path_list, 'board_serial')
+
+    @property
+    def product_serial(self):
+        # type: () -> str
+        """Determine server's serial number from DMI data in sysfs"""
+        return read_file(HostFacts._dmi_path_list, 'product_serial')
 
     @property
     def timestamp(self):

@@ -4521,7 +4521,6 @@ int OSD::shutdown()
   utime_t duration = ceph_clock_now() - start_time_func;
   dout(0) <<"Slow Shutdown duration:" << duration << " seconds" << dendl;
 
-  tracing::osd::tracer.shutdown();
 
   return r;
 }
@@ -7276,7 +7275,6 @@ void OSD::dispatch_session_waiting(const ceph::ref_t<Session>& session, OSDMapRe
 
 void OSD::ms_fast_dispatch(Message *m)
 {
-  auto dispatch_span = tracing::osd::tracer.start_trace(__func__);
   FUNCTRACE(cct);
   if (service.is_stopping()) {
     m->put();
@@ -7332,7 +7330,7 @@ void OSD::ms_fast_dispatch(Message *m)
     tracepoint(osd, ms_fast_dispatch, reqid.name._type,
         reqid.name._num, reqid.tid, reqid.inc);
   }
-  op->osd_parent_span = tracing::osd::tracer.add_span("op-request-created", dispatch_span);
+  op->osd_parent_span = tracing::osd::tracer.start_trace("op-request-created");
 
   if (m->trace)
     op->osd_trace.init("osd op", &trace_endpoint, &m->trace);
@@ -7570,6 +7568,18 @@ bool OSD::scrub_random_backoff()
 void OSD::sched_scrub()
 {
   auto& scrub_scheduler = service.get_scrub_services();
+
+  if (auto blocked_pgs = scrub_scheduler.get_blocked_pgs_count();
+      blocked_pgs > 0) {
+    // some PGs managed by this OSD were blocked by a locked object during
+    // scrub. This means we might not have the resources needed to scrub now.
+    dout(10)
+      << fmt::format(
+	   "{}: PGs are blocked while scrubbing due to locked objects ({} PGs)",
+	   __func__,
+	   blocked_pgs)
+      << dendl;
+  }
 
   // fail fast if no resources are available
   if (!scrub_scheduler.can_inc_scrubs()) {

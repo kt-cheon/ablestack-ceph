@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <iostream>
+#include <fstream>
 #include <random>
 
 #include <seastar/apps/lib/stop_signal.hh>
@@ -14,6 +15,7 @@
 #include <seastar/core/thread.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/net/inet_address.hh>
+#include <seastar/util/closeable.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/std-compat.hh>
 
@@ -173,6 +175,21 @@ static void override_seastar_opts(std::vector<const char*>& args)
   }
 }
 
+static std::ofstream maybe_set_logger()
+{
+  std::ofstream log_file_stream;
+  if (auto log_file = local_conf()->log_file; !log_file.empty()) {
+    log_file_stream.open(log_file, std::ios::app | std::ios::out);
+    try {
+      seastar::throw_system_error_on(log_file_stream.fail());
+    } catch (const std::system_error& e) {
+      ceph_abort_msg(fmt::format("unable to open log file: {}", e.what()));
+    }
+    logger().set_ostream(log_file_stream);
+  }
+  return log_file_stream;
+}
+
 int main(int argc, const char* argv[])
 {
   seastar::app_template::config app_cfg;
@@ -222,22 +239,22 @@ int main(int argc, const char* argv[])
               seastar::log_level::debug
             );
           }
-	  if (config.count("trace")) {
-	    seastar::global_logger_registry().set_all_loggers_level(
+          if (config.count("trace")) {
+            seastar::global_logger_registry().set_all_loggers_level(
               seastar::log_level::trace
             );
-	  }
+          }
           sharded_conf().start(init_params.name, cluster_name).get();
-          auto stop_conf = seastar::defer([] {
-            sharded_conf().stop().get();
-          });
+          auto stop_conf = seastar::deferred_stop(sharded_conf());
           sharded_perf_coll().start().get();
-          auto stop_perf_coll = seastar::defer([] {
-            sharded_perf_coll().stop().get();
-          });
+          auto stop_perf_coll = seastar::deferred_stop(sharded_perf_coll());
           local_conf().parse_config_files(conf_file_list).get();
           local_conf().parse_env().get();
           local_conf().parse_argv(config_proxy_args).get();
+          auto log_file_stream = maybe_set_logger();
+          auto reset_logger = seastar::defer([] {
+            logger().set_ostream(std::cerr);
+          });
           if (const auto ret = pidfile_write(local_conf()->pid_file);
               ret == -EACCES || ret == -EAGAIN) {
             ceph_abort_msg(
@@ -256,9 +273,7 @@ int main(int argc, const char* argv[])
           if (uint16_t prom_port = config["prometheus_port"].as<uint16_t>();
               prom_port != 0) {
             prom_server.start("prometheus").get();
-            stop_prometheus = seastar::make_shared(seastar::defer([&] {
-              prom_server.stop().get();
-            }));
+            stop_prometheus = seastar::make_shared(seastar::deferred_stop(prom_server));
 
             seastar::prometheus::config prom_config;
             prom_config.prefix = config["prometheus_prefix"].as<std::string>();
@@ -294,9 +309,7 @@ int main(int argc, const char* argv[])
                            std::ref(*store),
                            cluster_msgr, client_msgr,
                            hb_front_msgr, hb_back_msgr).get();
-          auto stop_osd = seastar::defer([&] {
-            osd.stop().get();
-          });
+          auto stop_osd = seastar::deferred_stop(osd);
           if (config.count("mkkey")) {
             make_keyring().get();
           }

@@ -77,12 +77,8 @@ Cache::retire_extent_ret Cache::retire_extent_addr(
     DEBUGT("retire {}~{} in cache -- {}", t, addr, length, *ext);
     if (ext->get_type() != extent_types_t::RETIRED_PLACEHOLDER) {
       t.add_to_read_set(ext);
-      return trans_intr::make_interruptible(
-        ext->wait_io()
-      ).then_interruptible([&t, ext=std::move(ext)]() mutable {
-        t.add_to_retired_set(ext);
-        return retire_extent_iertr::now();
-      });
+      t.add_to_retired_set(ext);
+      return retire_extent_iertr::now();
     }
     // the retired-placeholder exists
   } else {
@@ -498,6 +494,7 @@ void Cache::register_metrics()
   auto register_tree_metrics = [&labels_by_src, &onode_label, &omap_label, this](
       const sm::label_instance& tree_label,
       uint64_t& tree_depth,
+      int64_t& tree_extents_num,
       counter_by_src_t<tree_efforts_t>& committed_tree_efforts,
       counter_by_src_t<tree_efforts_t>& invalidated_tree_efforts) {
     metrics.add_group(
@@ -509,6 +506,12 @@ void Cache::register_metrics()
           sm::description("the depth of tree"),
           {tree_label}
         ),
+	sm::make_counter(
+	  "tree_extents_num",
+	  tree_extents_num,
+	  sm::description("num of extents of the tree"),
+	  {tree_label}
+	)
       }
     );
     for (auto& [src, src_label] : labels_by_src) {
@@ -570,21 +573,25 @@ void Cache::register_metrics()
   register_tree_metrics(
       onode_label,
       stats.onode_tree_depth,
+      stats.onode_tree_extents_num,
       stats.committed_onode_tree_efforts,
       stats.invalidated_onode_tree_efforts);
   register_tree_metrics(
       omap_label,
       stats.omap_tree_depth,
+      stats.omap_tree_extents_num,
       stats.committed_omap_tree_efforts,
       stats.invalidated_omap_tree_efforts);
   register_tree_metrics(
       lba_label,
       stats.lba_tree_depth,
+      stats.lba_tree_extents_num,
       stats.committed_lba_tree_efforts,
       stats.invalidated_lba_tree_efforts);
   register_tree_metrics(
       backref_label,
       stats.backref_tree_depth,
+      stats.backref_tree_extents_num,
       stats.committed_backref_tree_efforts,
       stats.invalidated_backref_tree_efforts);
 
@@ -695,13 +702,13 @@ void Cache::mark_dirty(CachedExtentRef ref)
   }
 
   lru.remove_from_lru(*ref);
-  add_to_dirty(ref);
   ref->state = CachedExtent::extent_state_t::DIRTY;
+  add_to_dirty(ref);
 }
 
 void Cache::add_to_dirty(CachedExtentRef ref)
 {
-  assert(ref->is_valid());
+  assert(ref->is_dirty());
   assert(!ref->primary_ref_list_hook.is_linked());
   intrusive_ptr_add_ref(&*ref);
   dirty.push_back(*ref);
@@ -746,6 +753,7 @@ void Cache::commit_replace_extent(
     CachedExtentRef next,
     CachedExtentRef prev)
 {
+  assert(next->is_dirty());
   assert(next->get_paddr() == prev->get_paddr());
   assert(next->version == prev->version + 1);
   extents.replace(*next, *prev);
@@ -1253,8 +1261,15 @@ record_t Cache::prepare_record(
     if (t.onode_tree_stats.depth) {
       stats.onode_tree_depth = t.onode_tree_stats.depth;
     }
+    if (t.omap_tree_stats.depth) {
+      stats.omap_tree_depth = t.omap_tree_stats.depth;
+    }
+    stats.onode_tree_extents_num += t.onode_tree_stats.extents_num_delta;
+    ceph_assert(stats.onode_tree_extents_num >= 0);
     get_by_src(stats.committed_onode_tree_efforts, trans_src
         ).increment(t.onode_tree_stats);
+    stats.omap_tree_extents_num += t.omap_tree_stats.extents_num_delta;
+    ceph_assert(stats.omap_tree_extents_num >= 0);
     get_by_src(stats.committed_omap_tree_efforts, trans_src
         ).increment(t.omap_tree_stats);
   }
@@ -1262,11 +1277,15 @@ record_t Cache::prepare_record(
   if (t.lba_tree_stats.depth) {
     stats.lba_tree_depth = t.lba_tree_stats.depth;
   }
+  stats.lba_tree_extents_num += t.lba_tree_stats.extents_num_delta;
+  ceph_assert(stats.lba_tree_extents_num >= 0);
   get_by_src(stats.committed_lba_tree_efforts, trans_src
       ).increment(t.lba_tree_stats);
   if (t.backref_tree_stats.depth) {
     stats.backref_tree_depth = t.backref_tree_stats.depth;
   }
+  stats.backref_tree_extents_num += t.backref_tree_stats.extents_num_delta;
+  ceph_assert(stats.backref_tree_extents_num >= 0);
   get_by_src(stats.committed_backref_tree_efforts, trans_src
       ).increment(t.backref_tree_stats);
 
@@ -1296,40 +1315,53 @@ void Cache::backref_batch_update(
   LOG_PREFIX(Cache::backref_batch_update);
   DEBUG("inserting {} entries", list.size());
   if (!backref_buffer) {
-    backref_buffer = std::make_unique<backref_buffer_t>();
+    backref_buffer = std::make_unique<backref_cache_t>();
   }
   // backref_buf_entry_t::laddr == L_ADDR_NULL means erase
   for (auto &ent : list) {
     if (ent->laddr == L_ADDR_NULL) {
-      auto [it, insert] = backref_remove_set.insert(*ent);
-      boost::ignore_unused(insert);
+      auto insert_set_iter = backref_inserted_set.find(
+	ent->paddr, backref_buf_entry_t::cmp_t());
+      if (insert_set_iter == backref_inserted_set.end()) {
+	// backref to be removed isn't in the backref buffer,
+	// it must be in the backref tree.
+	auto [it, insert] = backref_remove_set.insert(*ent);
+	boost::ignore_unused(insert);
 #ifndef NDEBUG
-      if (!insert) {
-	ERROR("backref_remove_set already contains {}", ent->paddr);
-      }
+	if (!insert) {
+	  ERROR("backref_remove_set already contains {}", ent->paddr);
+	}
 #endif
-      assert(insert);
+	assert(insert);
+      } else {
+	// the backref insertion hasn't been applied to the
+	// backref tree
+	auto seq = insert_set_iter->seq;
+	auto it = backref_buffer->backrefs_by_seq.find(seq);
+	ceph_assert(it != backref_buffer->backrefs_by_seq.end());
+	auto &backref_buf = it->second;
+	assert(insert_set_iter->backref_buf_hook.is_linked());
+	backref_buf.br_list.erase(
+	  backref_buf_entry_t::list_t::s_iterator_to(*insert_set_iter));
+	backref_inserted_set.erase(insert_set_iter);
+      }
     } else {
-#ifndef NDEBUG
-      auto r = backref_remove_set.erase(ent->paddr, backref_buf_entry_t::cmp_t());
-      if (r) {
-	ERROR("backref_remove_set contains: {}", ent->paddr);
-      }
-      assert(!r);
-#endif
       auto [it, insert] = backref_inserted_set.insert(*ent);
       boost::ignore_unused(insert);
       assert(insert);
     }
   }
 
-  auto iter = backref_buffer->backrefs.find(seq);
-  if (iter == backref_buffer->backrefs.end()) {
-    backref_buffer->backrefs.emplace(
+  auto iter = backref_buffer->backrefs_by_seq.find(seq);
+  if (iter == backref_buffer->backrefs_by_seq.end()) {
+    backref_buffer->backrefs_by_seq.emplace(
       seq, std::move(list));
   } else {
-    iter->second.insert(
-      iter->second.end(),
+    for (auto &ref : list) {
+      iter->second.br_list.push_back(*ref);
+    }
+    iter->second.backrefs.insert(
+      iter->second.backrefs.end(),
       std::make_move_iterator(list.begin()),
       std::make_move_iterator(list.end()));
   }
@@ -1581,6 +1613,7 @@ Cache::replay_delta(
         delta.laddr,
         delta.length,
         nullptr,
+        [](CachedExtent &) {},
         [](CachedExtent &) {}) :
       _get_extent_if_cached(
 	delta.paddr)
@@ -1711,24 +1744,17 @@ Cache::get_root_ret Cache::get_root(Transaction &t)
   LOG_PREFIX(Cache::get_root);
   if (t.root) {
     TRACET("root already on t -- {}", t, *t.root);
-    return get_root_iertr::make_ready_future<RootBlockRef>(
-      t.root);
+    return t.root->wait_io().then([&t] {
+      return get_root_iertr::make_ready_future<RootBlockRef>(
+	t.root);
+    });
   } else {
-    auto ret = root;
-    DEBUGT("root not on t -- {}", t, *ret);
-    return ret->wait_io().then([this, FNAME, ret, &t] {
-      TRACET("root wait io done -- {}", t, *ret);
-      if (!ret->is_valid()) {
-	DEBUGT("root is invalid -- {}", t, *ret);
-	++(get_by_src(stats.trans_conflicts_by_unknown, t.get_src()));
-	mark_transaction_conflicted(t, *ret);
-	return get_root_iertr::make_ready_future<RootBlockRef>();
-      } else {
-	t.root = ret;
-	t.add_to_read_set(ret);
-	return get_root_iertr::make_ready_future<RootBlockRef>(
-	  ret);
-      }
+    DEBUGT("root not on t -- {}", t, *root);
+    t.root = root;
+    t.add_to_read_set(root);
+    return root->wait_io().then([this] {
+      return get_root_iertr::make_ready_future<RootBlockRef>(
+	root);
     });
   }
 }
@@ -1739,7 +1765,8 @@ Cache::get_extent_ertr::future<CachedExtentRef> Cache::_get_extent_by_type(
   laddr_t laddr,
   seastore_off_t length,
   const Transaction::src_t* p_src,
-  extent_init_func_t &&extent_init_func)
+  extent_init_func_t &&extent_init_func,
+  extent_init_func_t &&on_cache)
 {
   return [=, extent_init_func=std::move(extent_init_func)]() mutable {
     src_ext_t* p_metric_key = nullptr;
@@ -1755,55 +1782,55 @@ Cache::get_extent_ertr::future<CachedExtentRef> Cache::_get_extent_by_type(
       return get_extent_ertr::make_ready_future<CachedExtentRef>();
     case extent_types_t::BACKREF_INTERNAL:
       return get_extent<backref::BackrefInternalNode>(
-	offset, length, p_metric_key, std::move(extent_init_func)
+	offset, length, p_metric_key, std::move(extent_init_func), std::move(on_cache)
       ).safe_then([](auto extent) {
 	return CachedExtentRef(extent.detach(), false /* add_ref */);
       });
     case extent_types_t::BACKREF_LEAF:
       return get_extent<backref::BackrefLeafNode>(
-	offset, length, p_metric_key, std::move(extent_init_func)
+	offset, length, p_metric_key, std::move(extent_init_func), std::move(on_cache)
       ).safe_then([](auto extent) {
 	return CachedExtentRef(extent.detach(), false /* add_ref */);
       });
     case extent_types_t::LADDR_INTERNAL:
       return get_extent<lba_manager::btree::LBAInternalNode>(
-	offset, length, p_metric_key, std::move(extent_init_func)
+	offset, length, p_metric_key, std::move(extent_init_func), std::move(on_cache)
       ).safe_then([](auto extent) {
 	return CachedExtentRef(extent.detach(), false /* add_ref */);
       });
     case extent_types_t::LADDR_LEAF:
       return get_extent<lba_manager::btree::LBALeafNode>(
-	offset, length, p_metric_key, std::move(extent_init_func)
+	offset, length, p_metric_key, std::move(extent_init_func), std::move(on_cache)
       ).safe_then([](auto extent) {
 	return CachedExtentRef(extent.detach(), false /* add_ref */);
       });
     case extent_types_t::OMAP_INNER:
       return get_extent<omap_manager::OMapInnerNode>(
-          offset, length, p_metric_key, std::move(extent_init_func)
+          offset, length, p_metric_key, std::move(extent_init_func), std::move(on_cache)
       ).safe_then([](auto extent) {
         return CachedExtentRef(extent.detach(), false /* add_ref */);
       });
     case extent_types_t::OMAP_LEAF:
       return get_extent<omap_manager::OMapLeafNode>(
-          offset, length, p_metric_key, std::move(extent_init_func)
+          offset, length, p_metric_key, std::move(extent_init_func), std::move(on_cache)
       ).safe_then([](auto extent) {
         return CachedExtentRef(extent.detach(), false /* add_ref */);
       });
     case extent_types_t::COLL_BLOCK:
       return get_extent<collection_manager::CollectionNode>(
-          offset, length, p_metric_key, std::move(extent_init_func)
+          offset, length, p_metric_key, std::move(extent_init_func), std::move(on_cache)
       ).safe_then([](auto extent) {
         return CachedExtentRef(extent.detach(), false /* add_ref */);
       });
     case extent_types_t::ONODE_BLOCK_STAGED:
       return get_extent<onode::SeastoreNodeExtent>(
-          offset, length, p_metric_key, std::move(extent_init_func)
+          offset, length, p_metric_key, std::move(extent_init_func), std::move(on_cache)
       ).safe_then([](auto extent) {
 	return CachedExtentRef(extent.detach(), false /* add_ref */);
       });
     case extent_types_t::OBJECT_DATA_BLOCK:
       return get_extent<ObjectDataBlock>(
-          offset, length, p_metric_key, std::move(extent_init_func)
+          offset, length, p_metric_key, std::move(extent_init_func), std::move(on_cache)
       ).safe_then([](auto extent) {
 	return CachedExtentRef(extent.detach(), false /* add_ref */);
       });
@@ -1812,13 +1839,13 @@ Cache::get_extent_ertr::future<CachedExtentRef> Cache::_get_extent_by_type(
       return get_extent_ertr::make_ready_future<CachedExtentRef>();
     case extent_types_t::TEST_BLOCK:
       return get_extent<TestBlock>(
-          offset, length, p_metric_key, std::move(extent_init_func)
+          offset, length, p_metric_key, std::move(extent_init_func), std::move(on_cache)
       ).safe_then([](auto extent) {
 	return CachedExtentRef(extent.detach(), false /* add_ref */);
       });
     case extent_types_t::TEST_BLOCK_PHYSICAL:
       return get_extent<TestBlockPhysical>(
-          offset, length, p_metric_key, std::move(extent_init_func)
+          offset, length, p_metric_key, std::move(extent_init_func), std::move(on_cache)
       ).safe_then([](auto extent) {
 	return CachedExtentRef(extent.detach(), false /* add_ref */);
       });
