@@ -149,9 +149,9 @@ export class BreadcrumbsComponent implements OnDestroy {
       })
       .join(' > ');
     if (currentLocation.length > 0) {
-      return `Ceph: ${currentLocation}`;
+      return `Glue: ${currentLocation}`;
     } else {
-      return 'Ceph';
+      return 'Glue';
     }
   }
 }
