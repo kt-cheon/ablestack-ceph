@@ -173,7 +173,7 @@ Name:		ceph
 Version:	@PROJECT_VERSION@
 Release:	@RPM_RELEASE@%{?dist}
 %if 0%{?fedora} || 0%{?rhel}
-Epoch:		2
+Epoch:		4
 %endif
 
 # define _epoch_prefix macro which will expand to the empty string if epoch is
